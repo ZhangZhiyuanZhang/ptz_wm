@@ -1,0 +1,22 @@
+name: ptz_wm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pyyaml
+  - tqdm
+  - numcodecs
+  - pytorch=2.3.*
+  - torchvision=0.18.*
+  - pytorch-cuda=12.1
+  - lightning=2.4.*
+  - tensorboard
+  - pip:
+      - zarr==3.1.6
+      - wandb
+      - imageio
+      - imageio-ffmpeg

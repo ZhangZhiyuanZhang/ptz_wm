@@ -1,0 +1,11 @@
+python eval_rollout.py \
+  --ckpt-path /home/zhiyuan/Project/ptz_wm/outputs/ckpts/image/image_vc_regv_noregt/last.ckpt \
+  --data-root /home/zhiyuan/Project/ptz_wm/data/replay_buffer.zarr \
+  --vision-key image \
+  --vision-type image \
+  --image-size 224 \
+  --batch-size 128 \
+  --action-mode all \
+  --reg-vision \
+  --reg-loss-type vc \
+  --max-rollout 6
