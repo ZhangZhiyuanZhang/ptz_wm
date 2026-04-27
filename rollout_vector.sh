@@ -1,0 +1,18 @@
+python eval_rollout.py \
+  --ckpt-path logs/ckpts/image_impala_rnn/010000.ckpt \
+  --data-root data/replay_buffer.zarr \
+  --vision-key image \
+  --encoder-type impala \
+  --predictor-type rnn \
+  --image-size 224 \
+  --vision-dim 512 \
+  --num-steps 5 \
+  --history-size 1 \
+  --max-rollout 4 \
+  --batch-size 128 \
+  --num-workers 4 \
+  --action-mode all \
+  --output-dir eval_rollout/impala_rnn_1w \
+  --json-filename rollout_metrics.json \
+  --plot-filename rollout_plot.png \
+  --plot-title "Impala-RNN Multi-step Rollout Error"

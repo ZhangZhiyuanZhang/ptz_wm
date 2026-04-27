@@ -1,5 +1,6 @@
 # Dataset / Outputs
 outputs/
+logs/
 data/
 wandb/
 lightning_logs/

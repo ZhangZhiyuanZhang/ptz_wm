@@ -1,0 +1,13 @@
+python train.py \
+  --data-root /home/zhiyuan/Project/ptz_wm/data/replay_buffer.zarr \
+  --vision-key image \
+  --encoder-type impala \
+  --predictor-type rnn \
+  --image-size 224 \
+  --vision-dim 512 \
+  --num-steps 5 \
+  --nsteps 2 \
+  --batch-size 64 \
+  --num-workers 4 \
+  --epochs 600 \
+  --wandb

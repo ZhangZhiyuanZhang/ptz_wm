@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Any, Dict, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import random
 
 class JEPAbase(nn.Module):
     def __init__(self, encoder, aencoder, predictor):
@@ -26,77 +26,14 @@ class JEPA(JEPAbase):
         encoder,
         aencoder,
         predictor,
-        vision_regularizer,
-        tactile_regularizer,
-        fused_regularizer,
+        regularizer,
         predcost,
         vision_dim: int,
-        tactile_dim: int,
-        fusion_type: str = "concat",
-        reg_vision: bool = True,
-        reg_tactile: bool = False,
     ):
         super().__init__(encoder, aencoder, predictor)
-        self.vision_regularizer = vision_regularizer
-        self.tactile_regularizer = tactile_regularizer
-        self.fused_regularizer = fused_regularizer
+        self.regularizer = regularizer
         self.predcost = predcost
-
         self.vision_dim = vision_dim
-        self.tactile_dim = tactile_dim
-        self.fusion_type = fusion_type.lower()
-
-        self.reg_vision = reg_vision
-        self.reg_tactile = reg_tactile
-
-    def _encode_modalities_and_joint(self, observations):
-        """
-        returns:
-          state: fused latent [B, Df, T, 1, 1]
-          z_v:   vision latent [B, Dv, T, 1, 1] or None
-          z_t:   tactile latent [B, Dt, T, 1, 1] or None
-        """
-        if (
-            isinstance(observations, dict)
-            and hasattr(self.encoder, "encode_modalities")
-            and hasattr(self.encoder, "fuse_latents")
-        ):
-            z_v, z_t = self.encoder.encode_modalities(observations)
-            state = self.encoder.fuse_latents(z_v, z_t)
-            return state, z_v, z_t
-
-        state = self.encoder(observations)
-        return state, None, None
-
-    def _compute_reg(self, z_v, z_t, state, actions_encoded):
-        total = state.new_tensor(0.0)
-        total_unweighted = state.new_tensor(0.0)
-        reg_dict = {}
-
-        if self.reg_vision and z_v is not None and self.vision_regularizer is not None:
-            rv, uv, dv = self.vision_regularizer(z_v)
-            total = total + rv
-            total_unweighted = total_unweighted + uv
-            for k, v in dv.items():
-                reg_dict[f"vision_{k}"] = v
-
-        if self.reg_tactile and z_t is not None and self.tactile_regularizer is not None:
-            rt, ut, dt = self.tactile_regularizer(z_t)
-            total = total + rt
-            total_unweighted = total_unweighted + ut
-            for k, v in dt.items():
-                reg_dict[f"tactile_{k}"] = v
-
-        if self.fused_regularizer is not None:
-            rf, uf, df = self.fused_regularizer(state, actions_encoded)
-            total = total + rf
-            total_unweighted = total_unweighted + uf
-            for k, v in df.items():
-                reg_dict[f"fused_{k}"] = v
-
-        reg_dict["reg_vision"] = float(self.reg_vision)
-        reg_dict["reg_tactile"] = float(self.reg_tactile)
-        return total, total_unweighted, reg_dict
 
     def unroll(
         self,
@@ -108,16 +45,11 @@ class JEPA(JEPAbase):
         compute_loss=True,
         return_all_steps=False,
     ):
-        state, z_v, z_t = self._encode_modalities_and_joint(observations)
+        state = self.encoder(observations)
         actions_encoded = self.action_encoder(actions) if actions is not None else None
 
         if compute_loss:
-            rloss, rloss_unweight, rloss_dict = self._compute_reg(
-                z_v=z_v,
-                z_t=z_t,
-                state=state,
-                actions_encoded=actions_encoded,
-            )
+            rloss, rloss_unweight, rloss_dict = self.regularizer(state, actions_encoded)
             ploss = 0.0
         else:
             rloss = rloss_unweight = rloss_dict = ploss = None
@@ -125,7 +57,7 @@ class JEPA(JEPAbase):
         all_steps = [] if return_all_steps else None
 
         if unroll_mode != "autoregressive":
-            raise ValueError("This TVB EB wrapper only supports autoregressive mode.")
+            raise ValueError("This wrapper only supports autoregressive mode.")
 
         effective_ctxt_window = 1 if self.single_unroll else ctxt_window_time
         predicted_states = state[:, :, :effective_ctxt_window]
@@ -162,53 +94,35 @@ class WorldModel(nn.Module):
         self,
         encoder: nn.Module,
         predictor: nn.Module,
-        vision_regularizer: nn.Module,
-        tactile_regularizer: nn.Module,
-        fused_regularizer: nn.Module,
+        regularizer: nn.Module,
         predcost: nn.Module,
         action_dim: int,
         vision_key: str,
-        vision_type: str = "image",
         image_size: Union[int, Tuple[int, int]] = 224,
-        use_tactile: bool = False,
-        tactile_key: str = None,
-        tactile_size=None,
         vision_dim: int = 512,
-        tactile_dim: int = 512,
-        fusion_type: str = "concat",
-        reg_vision: bool = True,
-        reg_tactile: bool = False,
+        grid_size: int = 16,
+        eq_weight: float = 0.0,
+        latent_type: str = "grid",
     ):
         super().__init__()
         self.vision_key = vision_key
-        self.vision_type = vision_type.lower()
         self.image_size = image_size
         self.action_dim = action_dim
-
-        self.use_tactile = use_tactile
-        self.tactile_key = tactile_key
-        self.tactile_size = tactile_size
-
         self.vision_dim = vision_dim
-        self.tactile_dim = tactile_dim
-        self.fusion_type = fusion_type.lower()
+        self.encoder = encoder
+        self.predictor = predictor
+        self.grid_size = grid_size
+        self.eq_weight = eq_weight
 
-        self.reg_vision = reg_vision
-        self.reg_tactile = reg_tactile
+        self.latent_type = latent_type
 
         self.jepa = JEPA(
             encoder=encoder,
             aencoder=nn.Identity(),
             predictor=predictor,
-            vision_regularizer=vision_regularizer,
-            tactile_regularizer=tactile_regularizer,
-            fused_regularizer=fused_regularizer,
+            regularizer=regularizer,
             predcost=predcost,
             vision_dim=vision_dim,
-            tactile_dim=tactile_dim,
-            fusion_type=self.fusion_type,
-            reg_vision=reg_vision,
-            reg_tactile=reg_tactile,
         )
 
         mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
@@ -224,12 +138,20 @@ class WorldModel(nn.Module):
         raise ValueError(f"Unsupported image_size: {self.image_size}")
 
     def _preprocess_image_btchw_to_bcthw(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        image-like input supports:
+          [B, T, H, W]      -> treated as single-channel
+          [B, T, C, H, W]
+
+        output:
+          [B, C, T, H, W]
+        """
         x = x.float()
         if x.max() > 1.5:
             x = x / 255.0
 
         if x.ndim == 4:
-            x = x.unsqueeze(2)
+            x = x.unsqueeze(2)  # [B,T,1,H,W]
 
         if x.ndim != 5:
             raise ValueError(f"Image input must be [B,T,C,H,W] or [B,T,H,W], got {tuple(x.shape)}")
@@ -253,131 +175,181 @@ class WorldModel(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).contiguous()
         return x
 
-    def _preprocess_pc_btnc(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        if x.ndim != 4:
-            raise ValueError(f"Point cloud input must be [B,T,N,C], got {tuple(x.shape)}")
-        return x.contiguous()
 
-    def _preprocess_tactile_btchw_to_bcthw(self, x: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
-        x = x.float()
-        if x.ndim == 4:
-            x = x.unsqueeze(2)
+    def transform_grid_tokens(self, z, flip=None, angle=0):
+        """
+        z: [B,T,P,D]
+        flip: None | "h" | "v"
+        angle: 0 | 1 | 2 | 3, rot90 k times
+        """
+        B, T, P, D = z.shape
+        H = W = self.grid_size
+        assert P == H * W, f"Expected P={H*W}, got P={P}"
 
-        if x.ndim != 5:
-            raise ValueError(f"Unsupported tactile shape: {tuple(x.shape)}")
+        z = z.view(B, T, H, W, D)
 
-        if x.max() > 1.5:
-            x = x / 255.0
+        if flip == "h":
+            z = torch.flip(z, dims=[3])  # W direction
+        elif flip == "v":
+            z = torch.flip(z, dims=[2])  # H direction
 
-        b, t, c, h, w = x.shape
-        x = x.reshape(b * t, c, h, w)
-        if h != out_h or w != out_w:
-            x = F.interpolate(
-                x,
-                size=(out_h, out_w),
-                mode="bilinear",
-                align_corners=False,
-            )
+        if angle is not None and angle != 0:
+            z = torch.rot90(z, k=angle, dims=[2, 3])
 
-        x = x.reshape(b, t, c, out_h, out_w)
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
-        return x
+        return z.reshape(B, T, P, D).contiguous()
 
-    def preprocess_vision(self, x: torch.Tensor) -> torch.Tensor:
-        if self.vision_type == "image":
-            return self._preprocess_image_btchw_to_bcthw(x)
-        if self.vision_type == "pc":
-            return self._preprocess_pc_btnc(x)
-        raise ValueError(f"Unknown vision_type: {self.vision_type}")
 
-    def _prepare_batch_obs(self, batch: dict):
-        vision_obs = self.preprocess_vision(batch[self.vision_key])
+    def transform_ptz_action(self, a, flip=None, angle=0):
+        """
+        a: [B,T,A]
 
-        if self.use_tactile:
-            tactile_obs = self._preprocess_tactile_btchw_to_bcthw(
-                batch[self.tactile_key],
-                out_h=self.tactile_size[0],
-                out_w=self.tactile_size[1],
-            )
-            return {
-                "vision": vision_obs,
-                "tactile": tactile_obs,
-            }
-        return vision_obs
+        Assumption:
+        a[..., 0] = pan/yaw-like horizontal action
+        a[..., 1] = tilt/pitch-like vertical action
+        a[..., 2] = zoom, unchanged
 
-    def encode_modalities(self, batch: dict):
-        obs = self._prepare_batch_obs(batch)
+        If your action dim > 3, remaining dims are kept unchanged.
+        """
+        if a.size(-1) < 2:
+            return a
 
-        if not (
-            self.use_tactile
-            and hasattr(self.jepa.encoder, "encode_modalities")
-            and hasattr(self.jepa.encoder, "fuse_latents")
-        ):
-            emb = self.encode(batch)
-            return {"joint_emb": emb}
+        out = a.clone()
 
-        z_v, z_t = self.jepa.encoder.encode_modalities(obs)
-        z_f = self.jepa.encoder.fuse_latents(z_v, z_t)
+        xy = out[..., :2]
 
-        return {
-            "vision_emb": z_v.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous(),
-            "tactile_emb": z_t.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous(),
-            "joint_emb": z_f.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous(),
-        }
+        if angle == 0:
+            R = xy.new_tensor([[1.0, 0.0], [0.0, 1.0]])
+        elif angle == 1:
+            R = xy.new_tensor([[0.0, -1.0], [1.0, 0.0]])
+        elif angle == 2:
+            R = xy.new_tensor([[-1.0, 0.0], [0.0, -1.0]])
+        elif angle == 3:
+            R = xy.new_tensor([[0.0, 1.0], [-1.0, 0.0]])
+        else:
+            raise ValueError(f"angle must be 0,1,2,3, got {angle}")
+
+        if flip == "h":
+            Fmat = xy.new_tensor([[-1.0, 0.0], [0.0, 1.0]])
+            R = Fmat @ R
+        elif flip == "v":
+            Fmat = xy.new_tensor([[1.0, 0.0], [0.0, -1.0]])
+            R = Fmat @ R
+
+        xy_new = torch.einsum("ij,btj->bti", R, xy)
+        out[..., :2] = xy_new
+
+        return out
+
 
     def training_losses(self, batch: dict, nsteps: int):
-        obs = self._prepare_batch_obs(batch)
-        act = batch["action"].float().transpose(1, 2)
+        if self.latent_type == "vector":
+            obs = self._preprocess_image_btchw_to_bcthw(batch[self.vision_key])
+            act = batch["action"].float().transpose(1, 2)
 
-        _, losses = self.jepa.unroll(
-            obs,
-            act,
-            nsteps=nsteps,
-            unroll_mode="autoregressive",
-            ctxt_window_time=1,
-            compute_loss=True,
-            return_all_steps=False,
-        )
-        total_loss, reg_loss, _, reg_dict, pred_loss = losses
-        return {
-            "loss": total_loss,
-            "pred_loss": pred_loss,
-            "reg_loss": reg_loss,
-            "reg_dict": reg_dict,
-        }
+            _, losses = self.jepa.unroll(
+                obs,
+                act,
+                nsteps=nsteps,
+                unroll_mode="autoregressive",
+                ctxt_window_time=1,
+                compute_loss=True,
+                return_all_steps=False,
+            )
 
-    def encode(self, batch: dict):
-        obs = self._prepare_batch_obs(batch)
-        enc_out = self.jepa.encoder(obs)
-        emb = enc_out.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
-        return emb
+            total_loss, reg_loss, _, reg_dict, pred_loss = losses
+            return {
+                "loss": total_loss,
+                "pred_loss": pred_loss,
+                "reg_loss": reg_loss,
+                "eq_loss": obs.new_tensor(0.0),
+                "reg_dict": reg_dict,
+            }
 
-    def predict_sequence(self, z_hist: torch.Tensor, action_seq: torch.Tensor) -> torch.Tensor:
-        z5 = z_hist.transpose(1, 2).unsqueeze(-1).unsqueeze(-1).contiguous()
-        a = action_seq.transpose(1, 2).contiguous()
-        pred5 = self.jepa.predictor(z5, a)
-        pred = pred5.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
-        return pred
+        elif self.latent_type == "grid":
+            obs = self._preprocess_image_btchw_to_bcthw(batch[self.vision_key])
+            act = batch["action"].float()  # [B,T,A]
+
+            z = self.encoder(obs)          # [B,T,P,D]
+
+            # 1-step teacher-forcing prediction over all adjacent pairs
+            z_in = z[:, :-1]               # [B,T-1,P,D]
+            a_in = act[:, :-1]             # [B,T-1,A]
+            target = z[:, 1:].detach()     # [B,T-1,P,D]
+
+            pred = self.predictor(z_in, a_in)
+            pred_loss = F.mse_loss(pred, target)
+
+            # Equivariance loss:
+            # P(tau(z), tau_a(a)) ~= tau(P(z, a))
+            if self.eq_weight > 0.0:
+                flip = random.choice([None, "h", "v"])
+                angle = random.choice([0, 1, 2, 3])
+
+                z_tau = self.transform_grid_tokens(z_in, flip=flip, angle=angle)
+                a_tau = self.transform_ptz_action(a_in, flip=flip, angle=angle)
+
+                pred_tau = self.predictor(z_tau, a_tau)
+                pred_expected = self.transform_grid_tokens(
+                    pred.detach(),
+                    flip=flip,
+                    angle=angle,
+                )
+
+                eq_loss = F.mse_loss(pred_tau, pred_expected)
+            else:
+                eq_loss = z.new_tensor(0.0)
+
+            reg_loss = z.new_tensor(0.0)
+            total_loss = pred_loss + self.eq_weight * eq_loss
+
+            return {
+                "loss": total_loss,
+                "pred_loss": pred_loss,
+                "reg_loss": reg_loss,
+                "eq_loss": eq_loss,
+                "reg_dict": {},
+            }
+        else:
+            raise ValueError(f"Unsupported latent_type: {self.latent_type}")
+
+    def encode(self, batch):
+        obs = self._preprocess_image_btchw_to_bcthw(batch[self.vision_key])
+
+        if self.latent_type == "vector":
+            enc_out = self.encoder(obs)  # [B,D,T,1,1]
+            return enc_out.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
+
+        if self.latent_type == "grid":
+            return self.encoder(obs)     # [B,T,P,D]
+
+    def predict_sequence(self, z_hist, action_seq):
+        if self.latent_type == "vector":
+            z5 = z_hist.transpose(1, 2).unsqueeze(-1).unsqueeze(-1).contiguous()
+            a = action_seq.transpose(1, 2).contiguous()
+            pred5 = self.predictor(z5, a)
+            return pred5.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
+
+        if self.latent_type == "grid":
+            return self.predictor(z_hist, action_seq)
 
     def rollout_latent(self, z0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Tensor:
+        # z0: [B,P,D]
+        # action_sequence: [B,S,T,A]
         B, S, T, A = action_sequence.shape
-        D = z0.size(-1)
+        P, D = z0.shape[1], z0.shape[2]
 
-        z = z0.unsqueeze(1).expand(B, S, 1, D).reshape(B * S, 1, D)
+        z = z0[:, None, None].expand(B, S, 1, P, D).reshape(B * S, 1, P, D)
         act = action_sequence.reshape(B * S, T, A)
 
         preds = []
         for t in range(T):
-            a_t = act[:, t:t + 1, :]
-            pred = self.predict_sequence(z[:, -1:, :], a_t)
-            z_next = pred[:, -1:, :]
+            pred = self.predict_sequence(z[:, -1:], act[:, t:t+1])
+            z_next = pred[:, -1:]
             preds.append(z_next)
             z = torch.cat([z, z_next], dim=1)
 
         pred_rollout = torch.cat(preds, dim=1)
-        pred_rollout = pred_rollout.reshape(B, S, T, D).contiguous()
-        return pred_rollout
+        return pred_rollout.reshape(B, S, T, P, D).contiguous()
 
     def _expand_goal_to_rollout(self, goal_emb: torch.Tensor, pred_emb: torch.Tensor) -> torch.Tensor:
         if goal_emb.ndim == 2:
@@ -391,33 +363,45 @@ class WorldModel(nn.Module):
         return goal_emb
 
     def criterion(self, pred_rollout, goal_emb, sum_all_diffs=False, discount=1.0):
-        goal_emb = self._expand_goal_to_rollout(goal_emb, pred_rollout)
-        total_step_cost = F.mse_loss(pred_rollout, goal_emb.detach(), reduction="none").sum(dim=-1)
+        # pred_rollout: [B,S,T,P,D]
+        # goal_emb: [B,P,D] or [B,1,P,D]
+        if goal_emb.ndim == 4:
+            goal_emb = goal_emb[:, -1]   # [B,P,D]
+
+        goal = goal_emb[:, None, None, :, :]  # [B,1,1,P,D]
+        step_cost = ((pred_rollout - goal.detach()) ** 2).mean(dim=(-1, -2))  # [B,S,T]
 
         if sum_all_diffs:
             if discount != 1.0:
-                T = total_step_cost.size(-1)
-                w = total_step_cost.new_tensor([discount ** t for t in range(T)]).view(1, 1, T)
-                total_step_cost = total_step_cost * w
-            return total_step_cost.sum(dim=-1)
+                T = step_cost.size(-1)
+                w = step_cost.new_tensor([discount ** t for t in range(T)]).view(1, 1, T)
+                step_cost = step_cost * w
+            return step_cost.sum(dim=-1)
 
-        return total_step_cost[:, :, -1]
+        return step_cost[:, :, -1]
 
-    def get_cost(self, current_info, action_candidates, goal_info, sum_all_diffs=False, discount=1.0):
+    def get_cost(
+        self,
+        current_info: dict,
+        action_candidates: torch.Tensor,
+        goal_info: dict,
+        sum_all_diffs: bool = False,
+        discount: float = 1.0,
+    ) -> torch.Tensor:
         device = action_candidates.device
 
-        current_batch = {self.vision_key: current_info[self.vision_key].to(device)}
-        goal_batch = {self.vision_key: goal_info[self.vision_key].to(device)}
-
-        if self.use_tactile:
-            current_batch[self.tactile_key] = current_info[self.tactile_key].to(device)
-            goal_batch[self.tactile_key] = goal_info[self.tactile_key].to(device)
+        current_batch = {
+            self.vision_key: current_info[self.vision_key].to(device),
+        }
+        goal_batch = {
+            self.vision_key: goal_info[self.vision_key].to(device),
+        }
 
         emb = self.encode(current_batch)
         goal_emb = self.encode(goal_batch)
 
-        z0 = emb[:, -1:, :]
-        pred_rollout = self.rollout_latent(z0, action_candidates)
+        z0 = emb[:, -1:, :]  # [B,1,D]
+        pred_rollout = self.rollout_latent(z0, action_candidates)  # [B,S,T,D]
 
         return self.criterion(
             pred_rollout=pred_rollout,

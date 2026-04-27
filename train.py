@@ -2,6 +2,7 @@ import argparse
 
 import lightning as pl
 import torch
+torch.set_float32_matmul_precision("high")
 import torch.nn as nn
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
@@ -10,26 +11,31 @@ import os
 
 from architectures import (
     ImpalaEncoder,
+    DinoGridEncoder,
     InverseDynamicsModel,
-    PointCloudTemporalEncoder,
-    PointNetEncoderXYZRGB,
     Projector,
     RNNPredictor,
-    build_vision_tactile_encoder,
+    DINOViTPredictor,
 )
+
 from dataset.zarr_dataset import ZarrDataset
 from jepa import WorldModel
 from losses import (
     SquareLossSeq,
-    VCRegularizer,
+    VC_IDM_Sim_Regularizer,
     SIGReg,
-    SIGRegRegularizer,
-    FusedDynamicsRegularizer,
+    SIGReg_IDM_Sim_Regularizer,
 )
 
 
 class JointTrainingModule(pl.LightningModule):
-    def __init__(self, model: WorldModel, lr=1e-4, weight_decay=1e-4, nsteps=2):
+    def __init__(
+        self,
+        model: WorldModel,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        nsteps: int = 2,
+    ):
         super().__init__()
         self.model = model
         self.lr = lr
@@ -46,6 +52,9 @@ class JointTrainingModule(pl.LightningModule):
         self.log("train/reg_loss", out["reg_loss"], prog_bar=True, on_step=True, on_epoch=True)
         for k, v in out["reg_dict"].items():
             self.log(f"train/{k}", v, prog_bar=False, on_step=True, on_epoch=True)
+        
+        if "eq_loss" in out:
+            self.log("train/eq_loss", out["eq_loss"], prog_bar=True, on_step=True, on_epoch=True)
         return out["loss"]
 
     def validation_step(self, batch, batch_idx):
@@ -55,6 +64,9 @@ class JointTrainingModule(pl.LightningModule):
         self.log("val/reg_loss", out["reg_loss"], prog_bar=True, on_step=False, on_epoch=True)
         for k, v in out["reg_dict"].items():
             self.log(f"val/{k}", v, prog_bar=False, on_step=False, on_epoch=True)
+        
+        if "eq_loss" in out:
+            self.log("val/eq_loss", out["eq_loss"], prog_bar=True, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]
@@ -63,8 +75,6 @@ class JointTrainingModule(pl.LightningModule):
 
 def build_dataloaders(args):
     keys_to_load = ["action", args.vision_key]
-    if args.use_tactile:
-        keys_to_load.append(args.tactile_key)
 
     dataset = ZarrDataset(
         root=args.data_root,
@@ -105,10 +115,8 @@ def build_dataloaders(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--data-root", type=str, required=True)
     parser.add_argument("--vision-key", type=str, default="wrist")
-    parser.add_argument("--vision-type", type=str, default="image", choices=["image", "pc"])
 
     parser.add_argument("--frameskip", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=5)
@@ -116,99 +124,79 @@ def parse_args():
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--split-seed", type=int, default=3072)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=6)
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=560)
 
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--vision-dim", type=int, default=512)
-
-    parser.add_argument("--pc-in-channels", type=int, default=6)
-
-    parser.add_argument("--use-tactile", action="store_true")
-    parser.add_argument("--tactile-key", type=str, default="left_tactile_camera_taxim")
-    parser.add_argument("--tactile-in-channels", type=int, default=3)
-    parser.add_argument("--tactile-height", type=int, default=10)
-    parser.add_argument("--tactile-width", type=int, default=14)
-    parser.add_argument("--tactile-dim", type=int, default=512)
-
-    parser.add_argument("--fusion-type", type=str, default="concat",
-                        choices=["concat", "gate", "film", "attn"])
-    parser.add_argument("--fusion-latent-dim", type=int, default=None)
-    parser.add_argument("--fusion-hidden-dim", type=int, default=None)
-    parser.add_argument("--attn-d-model", type=int, default=256)
-    parser.add_argument("--attn-heads", type=int, default=4)
-    parser.add_argument("--attn-layers", type=int, default=2)
-    parser.add_argument("--attn-mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--attn-dropout", type=float, default=0.0)
 
     parser.add_argument("--nsteps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
 
+    # Reg choice
     parser.add_argument("--reg-loss-type", type=str, default="vc", choices=["vc", "sigreg"])
     parser.add_argument("--use-proj", action="store_true")
 
-    # branch VC
+    # VC loss
     parser.add_argument("--cov-coeff", type=float, default=1.0)
     parser.add_argument("--std-coeff", type=float, default=1.0)
 
-    # branch SIGReg
+    # SIGReg loss
     parser.add_argument("--sigreg-coeff", type=float, default=0.1)
     parser.add_argument("--sigreg-knots", type=int, default=17)
     parser.add_argument("--sigreg-num-proj", type=int, default=1024)
 
-    # fused dynamics reg
+    # Shared extras
     parser.add_argument("--sim-coeff-t", type=float, default=0.1)
     parser.add_argument("--idm-coeff", type=float, default=0.1)
     parser.add_argument("--idm-after-proj", action="store_true")
     parser.add_argument("--sim-t-after-proj", action="store_true")
 
-    # branch regularization switches
-    parser.add_argument("--reg-vision", action="store_true")
-    parser.add_argument("--reg-tactile", action="store_true")
-
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", type=str, default="vt-wm")
+    parser.add_argument("--wandb-project", type=str, default="ptz-wm")
     parser.add_argument("--wandb-entity", type=str, default=None)
-    parser.add_argument("--wandb-save-dir", type=str, default="outputs/wandb")
+    parser.add_argument("--wandb-save-dir", type=str, default="logs/wandb")
     parser.add_argument("--wandb-name", type=str, default=None)
 
-    parser.add_argument("--save-dir", type=str, default="outputs/ckpts")
+    parser.add_argument("--save-dir", type=str, default="logs/ckpts")
     parser.add_argument("--ckpt-every-n-steps", type=int, default=10000)
+
+    parser.add_argument("--dino-name", type=str, default="dinov2_vits14")
+    parser.add_argument("--pred-depth", type=int, default=6)
+    parser.add_argument("--pred-heads", type=int, default=6)
+    parser.add_argument("--pred-embed-dim", type=int, default=384)
+    parser.add_argument("--pred-mlp-ratio", type=float, default=4.0)
+
+    parser.add_argument("--encoder-type", type=str, default="dino", choices=["impala", "dino"])
+    parser.add_argument("--predictor-type", type=str, default="vit", choices=["rnn", "vit"])
+    parser.add_argument("--eq-weight", type=float, default=0.0)
 
     return parser.parse_args()
 
-
-def build_vision_encoder(args):
-    if args.vision_type == "image":
-        return ImpalaEncoder(
-            input_channels=3,
-            input_shape=(3, args.image_size, args.image_size),
-            mlp_output_dim=args.vision_dim,
-            final_ln=True,
-        )
-    elif args.vision_type == "pc":
-        point_encoder = PointNetEncoderXYZRGB(
-            in_channels=args.pc_in_channels,
-            out_channels=args.vision_dim,
-        )
-        return PointCloudTemporalEncoder(
-            point_encoder=point_encoder,
-            out_dim=args.vision_dim,
-        )
-    raise ValueError(f"Unknown vision_type: {args.vision_type}")
-
-
-def build_branch_regularizer(branch_dim: int, args):
+def build_regularizer(reg_hidden_dim: int, action_dim: int, args):
     projector = None
     if args.use_proj:
-        projector = Projector(f"{branch_dim}-{branch_dim*4}-{branch_dim*4}")
+        projector = Projector(f"{reg_hidden_dim}-{reg_hidden_dim*4}-{reg_hidden_dim*4}")
+
+    idm_in_dim = projector.out_dim if projector is not None and args.idm_after_proj else reg_hidden_dim
+    idm = InverseDynamicsModel(
+        state_dim=idm_in_dim,
+        hidden_dim=256,
+        action_dim=action_dim,
+    )
 
     if args.reg_loss_type == "vc":
-        return VCRegularizer(
+        return VC_IDM_Sim_Regularizer(
             cov_coeff=args.cov_coeff,
             std_coeff=args.std_coeff,
+            sim_coeff_t=args.sim_coeff_t,
+            idm_coeff=args.idm_coeff,
+            idm=idm,
             projector=projector,
+            spatial_as_samples=False,
+            idm_after_proj=args.idm_after_proj,
+            sim_t_after_proj=args.sim_t_after_proj,
         )
 
     if args.reg_loss_type == "sigreg":
@@ -216,103 +204,98 @@ def build_branch_regularizer(branch_dim: int, args):
             knots=args.sigreg_knots,
             num_proj=args.sigreg_num_proj,
         )
-        return SIGRegRegularizer(
+        return SIGReg_IDM_Sim_Regularizer(
             sigreg_coeff=args.sigreg_coeff,
+            sim_coeff_t=args.sim_coeff_t,
+            idm_coeff=args.idm_coeff,
             sigreg=sigreg,
+            idm=idm,
             projector=projector,
+            idm_after_proj=args.idm_after_proj,
+            sim_t_after_proj=args.sim_t_after_proj,
         )
 
     raise ValueError(f"Unknown reg_loss_type: {args.reg_loss_type}")
 
 
-def build_fused_regularizer(fused_dim: int, action_dim: int, args):
-    projector = None
-    if args.use_proj:
-        projector = Projector(f"{fused_dim}-{fused_dim*4}-{fused_dim*4}")
-
-    idm_in_dim = projector.out_dim if projector is not None and args.idm_after_proj else fused_dim
-    idm = InverseDynamicsModel(
-        state_dim=idm_in_dim,
-        hidden_dim=256,
-        action_dim=action_dim,
-    )
-
-    return FusedDynamicsRegularizer(
-        sim_coeff_t=args.sim_coeff_t,
-        idm_coeff=args.idm_coeff,
-        idm=idm,
-        projector=projector,
-        idm_after_proj=args.idm_after_proj,
-        sim_t_after_proj=args.sim_t_after_proj,
-    )
-
-
-def build_model(args, action_dim: int):
-    vision_encoder = build_vision_encoder(args)
-
-    if args.use_tactile:
-        tactile_encoder = ImpalaEncoder(
-            input_channels=args.tactile_in_channels,
-            input_shape=(args.tactile_in_channels, args.tactile_height, args.tactile_width),
-            mlp_output_dim=args.tactile_dim,
+def build_model(args, action_dim: int) -> WorldModel:
+    if args.encoder_type == "impala":
+        encoder = ImpalaEncoder(
+            input_channels=3,
+            input_shape=(3, args.image_size, args.image_size),
+            mlp_output_dim=args.vision_dim,
             final_ln=True,
         )
-        encoder, predictor_hidden = build_vision_tactile_encoder(
-            fusion_type=args.fusion_type,
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
-            vision_dim=args.vision_dim,
-            tactile_dim=args.tactile_dim,
-            fusion_latent_dim=args.fusion_latent_dim,
-            fusion_hidden_dim=args.fusion_hidden_dim,
-            attn_d_model=args.attn_d_model,
-            attn_heads=args.attn_heads,
-            attn_layers=args.attn_layers,
-            attn_mlp_ratio=args.attn_mlp_ratio,
-            attn_dropout=args.attn_dropout,
+
+        predictor = RNNPredictor(
+            hidden_size=args.vision_dim,
+            action_dim=action_dim,
+            num_layers=1,
+            final_ln=nn.LayerNorm(args.vision_dim),
         )
-    else:
-        encoder = vision_encoder
-        predictor_hidden = args.vision_dim
 
-    predictor = RNNPredictor(
-        hidden_size=predictor_hidden,
-        action_dim=action_dim,
-        num_layers=1,
-        final_ln=nn.LayerNorm(predictor_hidden),
-    )
+        return WorldModel(
+            encoder=encoder,
+            predictor=predictor,
+            regularizer=build_regularizer(args.vision_dim, action_dim, args),
+            predcost=SquareLossSeq(),
+            action_dim=action_dim,
+            vision_key=args.vision_key,
+            image_size=args.image_size,
+            vision_dim=args.vision_dim,
+            latent_type="vector",
+            grid_size=None,
+            eq_weight=0.0,
+        )
 
-    vision_regularizer = build_branch_regularizer(args.vision_dim, args) if args.reg_vision else None
-    tactile_regularizer = build_branch_regularizer(args.tactile_dim, args) if (args.use_tactile and args.reg_tactile) else None
-    fused_regularizer = build_fused_regularizer(predictor_hidden, action_dim, args)
+    if args.encoder_type == "dino":
+        encoder = DinoGridEncoder(
+            name=args.dino_name,
+            feature_key="x_norm_patchtokens",
+            freeze=True,
+            use_adapter=False,
+        )
 
-    predcost = SquareLossSeq()
+        grid_size = args.image_size // encoder.patch_size
+        num_patches = grid_size * grid_size
+        vision_dim = encoder.emb_dim
 
-    model = WorldModel(
-        encoder=encoder,
-        predictor=predictor,
-        vision_regularizer=vision_regularizer,
-        tactile_regularizer=tactile_regularizer,
-        fused_regularizer=fused_regularizer,
-        predcost=predcost,
-        action_dim=action_dim,
-        vision_key=args.vision_key,
-        vision_type=args.vision_type,
-        image_size=args.image_size,
-        use_tactile=args.use_tactile,
-        tactile_key=args.tactile_key,
-        tactile_size=(args.tactile_height, args.tactile_width),
-        vision_dim=args.vision_dim,
-        tactile_dim=args.tactile_dim,
-        fusion_type=args.fusion_type,
-        reg_vision=args.reg_vision,
-        reg_tactile=args.reg_tactile,
-    )
-    return model
+        if args.predictor_type == "vit":
+            predictor = DINOViTPredictor(
+                num_patches=num_patches,
+                num_frames=args.num_steps,
+                dim=vision_dim,
+                action_dim=action_dim,
+                depth=args.pred_depth,
+                heads=args.pred_heads,
+                mlp_dim=int(vision_dim * args.pred_mlp_ratio),
+                dim_head=64,
+                dropout=0.0,
+            )
+
+        return WorldModel(
+            encoder=encoder,
+            predictor=predictor,
+            regularizer=None,
+            predcost=SquareLossSeq(),
+            action_dim=action_dim,
+            vision_key=args.vision_key,
+            image_size=args.image_size,
+            vision_dim=vision_dim,
+            latent_type="grid",
+            grid_size=grid_size,
+            eq_weight=args.eq_weight,
+        )
 
 
 def main():
     args = parse_args()
+
+    if args.encoder_type == "impala":
+        assert args.predictor_type == "rnn"
+
+    if args.encoder_type == "dino":
+        assert args.predictor_type == "vit"
 
     dataset, train_loader, val_loader = build_dataloaders(args)
     action_dim = dataset.get_dim("action")
@@ -325,12 +308,10 @@ def main():
         nsteps=args.nsteps,
     )
 
-    exp_name = f"{args.vision_type}/{args.vision_key}"
-    if args.use_tactile:
-        exp_name = f"{args.vision_type}/{args.vision_key}_{args.tactile_key}/{args.fusion_type}"
-    exp_name += f"_{args.reg_loss_type}"
-    exp_name += "_regv" if args.reg_vision else "_noregv"
-    exp_name += "_regt" if args.reg_tactile else "_noregt"
+    if args.eq_weight > 0.0:
+        exp_name = f"{args.vision_key}_{args.encoder_type}_{args.predictor_type}_eq"
+    else:
+        exp_name = f"{args.vision_key}_{args.encoder_type}_{args.predictor_type}"
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=f"{args.save_dir}/{exp_name}",
@@ -361,7 +342,6 @@ def main():
         devices=1,
         log_every_n_steps=10,
     )
-
 
     ckpt_dir = f"{args.save_dir}/{exp_name}"
     last_ckpt = os.path.join(ckpt_dir, "last.ckpt")

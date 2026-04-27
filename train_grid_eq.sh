@@ -1,0 +1,17 @@
+python train.py \
+  --data-root /home/zhiyuan/Project/ptz_wm/data/replay_buffer.zarr \
+  --vision-key image \
+  --encoder-type dino \
+  --predictor-type vit \
+  --image-size 224 \
+  --num-steps 5 \
+  --nsteps 1 \
+  --dino-name dinov2_vits14 \
+  --pred-depth 6 \
+  --pred-heads 6 \
+  --pred-mlp-ratio 4.0 \
+  --eq-weight 0.05 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --epochs 600 \
+  --wandb

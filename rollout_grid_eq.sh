@@ -1,0 +1,22 @@
+python eval_rollout.py \
+  --ckpt-path logs/ckpts/image_dino_vit_eq/010000.ckpt \
+  --data-root data/replay_buffer.zarr \
+  --vision-key image \
+  --encoder-type dino \
+  --predictor-type vit \
+  --image-size 224 \
+  --dino-name dinov2_vits14 \
+  --num-steps 5 \
+  --pred-depth 6 \
+  --pred-heads 6 \
+  --pred-embed-dim 384 \
+  --pred-mlp-ratio 4.0 \
+  --history-size 1 \
+  --max-rollout 4 \
+  --batch-size 128 \
+  --num-workers 4 \
+  --action-mode all \
+  --output-dir eval_rollout/dino_vit_1w \
+  --json-filename rollout_metrics.json \
+  --plot-filename rollout_plot.png \
+  --plot-title "DINO-ViT Multi-step Rollout Error"

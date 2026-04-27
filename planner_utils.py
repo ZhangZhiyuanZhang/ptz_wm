@@ -9,20 +9,18 @@ import torch.nn as nn
 
 from architectures import (
     ImpalaEncoder,
+    DinoGridEncoder,
     InverseDynamicsModel,
-    PointCloudTemporalEncoder,
-    PointNetEncoderXYZRGB,
     Projector,
     RNNPredictor,
-    build_vision_tactile_encoder,
+    DINOViTPredictor,
 )
 from jepa import WorldModel
 from losses import (
     SquareLossSeq,
-    VCRegularizer,
+    VC_IDM_Sim_Regularizer,
     SIGReg,
-    SIGRegRegularizer,
-    FusedDynamicsRegularizer,
+    SIGReg_IDM_Sim_Regularizer,
 )
 
 
@@ -37,101 +35,85 @@ class PlannerConfig:
     action_high: float = 1.0
     action_dim: int = 6
 
-    vision_key: str = "front"
-    vision_type: str = "image"   # image | pc
-    image_size: int = 224
+    # Make eval-time CEM action samples closer to the training/demo action distribution.
+    # None of these use future GT action chunks.
+    use_action_prior: bool = True
+    action_prior_std_scale: float = 1.0
+    action_prior_min_std: float = 0.05
+    warm_start_mode: str = "prev_action"  # none | prev_action
+    warm_start_std: float = 0.15
+    warm_start_mix: float = 0.5  # 0: pure dataset mean, 1: pure previous action
+    cem_min_std: float = 0.03
+    action_smooth_weight: float = 0.05
+    action_magnitude_weight: float = 0.01
 
-    pc_in_channels: int = 3
-    pc_use_layernorm: bool = False
-    pc_final_norm: str = "none"
+    vision_key: str = "front"
+    image_size: int = 224
 
     sum_all_diffs: bool = False
     discount: float = 1.0
 
     vision_dim: int = 512
-    tactile_dim: int = 512
-
-    use_tactile: bool = False
-    tactile_key: str = "left_tactile_camera_taxim"
-    tactile_in_channels: int = 3
-    tactile_height: int = 10
-    tactile_width: int = 14
-
-    fusion_type: str = "concat"
-    fusion_latent_dim: Optional[int] = None
-    fusion_hidden_dim: Optional[int] = None
-
-    attn_d_model: int = 256
-    attn_heads: int = 4
-    attn_layers: int = 2
-    attn_mlp_ratio: float = 4.0
-    attn_dropout: float = 0.0
 
     reg_loss_type: str = "vc"    # vc | sigreg
     use_proj: bool = False
 
-    # branch VC
     cov_coeff: float = 1.0
     std_coeff: float = 1.0
 
-    # branch SIGReg
-    sigreg_coeff: float = 1.0
+    sigreg_coeff: float = 0.1
     sigreg_knots: int = 17
     sigreg_num_proj: int = 1024
 
-    # fused dynamics reg
     sim_coeff_t: float = 0.1
     idm_coeff: float = 0.1
     idm_after_proj: bool = False
     sim_t_after_proj: bool = False
 
-    # branch switches
-    reg_vision: bool = True
-    reg_tactile: bool = False
+    dino_name: str = "dinov2_vits14"
+    num_steps: int = 5
+    pred_depth: int = 6
+    pred_heads: int = 6
+    pred_embed_dim: int = 384
+    pred_mlp_ratio: float = 4.0
+    eq_weight: float = 0.0
+
+    encoder_type: str = "dino"
+    predictor_type: str = "vit"
 
 
-def build_vision_encoder(cfg: PlannerConfig) -> nn.Module:
-    if cfg.vision_type == "image":
-        return ImpalaEncoder(
-            input_channels=3,
-            input_shape=(3, cfg.image_size, cfg.image_size),
-            mlp_output_dim=cfg.vision_dim,
-            final_ln=True,
-        )
-
-    if cfg.vision_type == "pc":
-        point_encoder = PointNetEncoderXYZRGB(
-            in_channels=cfg.pc_in_channels,
-            out_channels=cfg.vision_dim,
-        )
-        return PointCloudTemporalEncoder(
-            point_encoder=point_encoder,
-            out_dim=cfg.vision_dim,
-            final_ln=True,
-        )
-
-    raise ValueError(f"Unknown vision_type: {cfg.vision_type}")
-
-
-def build_tactile_encoder(cfg: PlannerConfig) -> nn.Module:
+def build_vision_encoder(cfg):
     return ImpalaEncoder(
-        input_channels=cfg.tactile_in_channels,
-        input_shape=(cfg.tactile_in_channels, cfg.tactile_height, cfg.tactile_width),
-        mlp_output_dim=cfg.tactile_dim,
+        input_channels=3,
+        input_shape=(3, cfg.image_size, cfg.image_size),
+        mlp_output_dim=cfg.vision_dim,
         final_ln=True,
     )
 
 
-def build_branch_regularizer(branch_dim: int, cfg: PlannerConfig):
+def build_regularizer(reg_hidden_dim: int, action_dim: int, cfg: PlannerConfig):
     projector = None
     if cfg.use_proj:
-        projector = Projector(f"{branch_dim}-{branch_dim*4}-{branch_dim*4}")
+        projector = Projector(f"{reg_hidden_dim}-{reg_hidden_dim*4}-{reg_hidden_dim*4}")
+
+    idm_in_dim = projector.out_dim if projector is not None and cfg.idm_after_proj else reg_hidden_dim
+    idm = InverseDynamicsModel(
+        state_dim=idm_in_dim,
+        hidden_dim=256,
+        action_dim=action_dim,
+    )
 
     if cfg.reg_loss_type == "vc":
-        return VCRegularizer(
+        return VC_IDM_Sim_Regularizer(
             cov_coeff=cfg.cov_coeff,
             std_coeff=cfg.std_coeff,
+            sim_coeff_t=cfg.sim_coeff_t,
+            idm_coeff=cfg.idm_coeff,
+            idm=idm,
             projector=projector,
+            spatial_as_samples=False,
+            idm_after_proj=cfg.idm_after_proj,
+            sim_t_after_proj=cfg.sim_t_after_proj,
         )
 
     if cfg.reg_loss_type == "sigreg":
@@ -139,93 +121,88 @@ def build_branch_regularizer(branch_dim: int, cfg: PlannerConfig):
             knots=cfg.sigreg_knots,
             num_proj=cfg.sigreg_num_proj,
         )
-        return SIGRegRegularizer(
+        return SIGReg_IDM_Sim_Regularizer(
             sigreg_coeff=cfg.sigreg_coeff,
+            sim_coeff_t=cfg.sim_coeff_t,
+            idm_coeff=cfg.idm_coeff,
             sigreg=sigreg,
+            idm=idm,
             projector=projector,
+            idm_after_proj=cfg.idm_after_proj,
+            sim_t_after_proj=cfg.sim_t_after_proj,
         )
 
     raise ValueError(f"Unknown reg_loss_type: {cfg.reg_loss_type}")
 
 
-def build_fused_regularizer(fused_dim: int, action_dim: int, cfg: PlannerConfig):
-    projector = None
-    if cfg.use_proj:
-        projector = Projector(f"{fused_dim}-{fused_dim*4}-{fused_dim*4}")
-
-    idm_in_dim = projector.out_dim if projector is not None and cfg.idm_after_proj else fused_dim
-    idm = InverseDynamicsModel(
-        state_dim=idm_in_dim,
-        hidden_dim=256,
-        action_dim=action_dim,
-    )
-
-    return FusedDynamicsRegularizer(
-        sim_coeff_t=cfg.sim_coeff_t,
-        idm_coeff=cfg.idm_coeff,
-        idm=idm,
-        projector=projector,
-        idm_after_proj=cfg.idm_after_proj,
-        sim_t_after_proj=cfg.sim_t_after_proj,
-    )
-
-
 def build_model(cfg: PlannerConfig) -> WorldModel:
-    vision_encoder = build_vision_encoder(cfg)
-
-    if cfg.use_tactile:
-        tactile_encoder = build_tactile_encoder(cfg)
-        encoder, predictor_hidden = build_vision_tactile_encoder(
-            fusion_type=cfg.fusion_type,
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
-            vision_dim=cfg.vision_dim,
-            tactile_dim=cfg.tactile_dim,
-            fusion_latent_dim=cfg.fusion_latent_dim,
-            fusion_hidden_dim=cfg.fusion_hidden_dim,
-            attn_d_model=cfg.attn_d_model,
-            attn_heads=cfg.attn_heads,
-            attn_layers=cfg.attn_layers,
-            attn_mlp_ratio=cfg.attn_mlp_ratio,
-            attn_dropout=cfg.attn_dropout,
+    if cfg.encoder_type == "impala":
+        encoder = ImpalaEncoder(
+            input_channels=3,
+            input_shape=(3, cfg.image_size, cfg.image_size),
+            mlp_output_dim=cfg.vision_dim,
+            final_ln=True,
         )
-    else:
-        encoder = vision_encoder
-        predictor_hidden = cfg.vision_dim
 
-    predictor = RNNPredictor(
-        hidden_size=predictor_hidden,
-        action_dim=cfg.action_dim,
-        num_layers=1,
-        final_ln=nn.LayerNorm(predictor_hidden),
-    )
+        predictor = RNNPredictor(
+            hidden_size=cfg.vision_dim,
+            action_dim=cfg.action_dim,
+            num_layers=1,
+            final_ln=nn.LayerNorm(cfg.vision_dim),
+        )
 
-    vision_regularizer = build_branch_regularizer(cfg.vision_dim, cfg) if cfg.reg_vision else None
-    tactile_regularizer = build_branch_regularizer(cfg.tactile_dim, cfg) if (cfg.use_tactile and cfg.reg_tactile) else None
-    fused_regularizer = build_fused_regularizer(predictor_hidden, cfg.action_dim, cfg)
+        return WorldModel(
+            encoder=encoder,
+            predictor=predictor,
+            regularizer=build_regularizer(cfg.vision_dim, cfg.action_dim, cfg),
+            predcost=SquareLossSeq(),
+            action_dim=cfg.action_dim,
+            vision_key=cfg.vision_key,
+            image_size=cfg.image_size,
+            vision_dim=cfg.vision_dim,
+            latent_type="vector",
+            grid_size=None,
+            eq_weight=0.0,
+        )
 
-    predcost = SquareLossSeq()
+    if cfg.encoder_type == "dino":
+        encoder = DinoGridEncoder(
+            name=cfg.dino_name,
+            feature_key="x_norm_patchtokens",
+            freeze=True,
+            use_adapter=False,
+        )
 
-    return WorldModel(
-        encoder=encoder,
-        predictor=predictor,
-        vision_regularizer=vision_regularizer,
-        tactile_regularizer=tactile_regularizer,
-        fused_regularizer=fused_regularizer,
-        predcost=predcost,
-        action_dim=cfg.action_dim,
-        vision_key=cfg.vision_key,
-        vision_type=cfg.vision_type,
-        image_size=cfg.image_size,
-        use_tactile=cfg.use_tactile,
-        tactile_key=cfg.tactile_key,
-        tactile_size=(cfg.tactile_height, cfg.tactile_width),
-        vision_dim=cfg.vision_dim,
-        tactile_dim=cfg.tactile_dim,
-        fusion_type=cfg.fusion_type,
-        reg_vision=cfg.reg_vision,
-        reg_tactile=cfg.reg_tactile,
-    )
+        grid_size = cfg.image_size // encoder.patch_size
+        num_patches = grid_size * grid_size
+        vision_dim = encoder.emb_dim
+
+        if cfg.predictor_type == "vit":
+            predictor = DINOViTPredictor(
+                num_patches=num_patches,
+                num_frames=cfg.num_steps,
+                dim=vision_dim,
+                action_dim=cfg.action_dim,
+                depth=cfg.pred_depth,
+                heads=cfg.pred_heads,
+                mlp_dim=int(vision_dim * cfg.pred_mlp_ratio),
+                dim_head=64,
+                dropout=0.0,
+            )
+
+        return WorldModel(
+            encoder=encoder,
+            predictor=predictor,
+            regularizer=None,
+            predcost=SquareLossSeq(),
+            action_dim=cfg.action_dim,
+            vision_key=cfg.vision_key,
+            image_size=cfg.image_size,
+            vision_dim=vision_dim,
+            latent_type="grid",
+            grid_size=grid_size,
+            eq_weight=cfg.eq_weight,
+        )
 
 
 def load_lightning_ckpt(model: torch.nn.Module, ckpt_path: str) -> torch.nn.Module:
@@ -263,16 +240,10 @@ def init_history_buffers(
     obs: Dict[str, np.ndarray],
     history_size: int,
     vision_key: str,
-    use_tactile: bool = False,
-    tactile_key: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     out = {}
     v = obs[vision_key]
     out[vision_key] = np.repeat(v[:, None], history_size, axis=1)
-
-    if use_tactile:
-        t = obs[tactile_key]
-        out[tactile_key] = np.repeat(t[:, None], history_size, axis=1)
 
     return out
 
@@ -281,53 +252,119 @@ def update_history_buffers(
     history: Dict[str, np.ndarray],
     obs: Dict[str, np.ndarray],
     vision_key: str,
-    use_tactile: bool = False,
-    tactile_key: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     history[vision_key] = np.concatenate(
         [history[vision_key][:, 1:], obs[vision_key][:, None]],
         axis=1,
     )
-    if use_tactile:
-        history[tactile_key] = np.concatenate(
-            [history[tactile_key][:, 1:], obs[tactile_key][:, None]],
-            axis=1,
-        )
     return history
 
 
 class BatchedCEMPlanner:
-    def __init__(self, model: WorldModel, cfg: PlannerConfig, device: str = "cuda") -> None:
+    def __init__(
+        self,
+        model: WorldModel,
+        cfg: PlannerConfig,
+        device: str = "cuda",
+        action_mean: Optional[np.ndarray] = None,
+        action_std: Optional[np.ndarray] = None,
+    ) -> None:
         self.model = model
         self.cfg = cfg
         self.device = device
 
+        self.action_mean = None
+        self.action_std = None
+
+        if action_mean is not None:
+            self.action_mean = torch.as_tensor(
+                action_mean,
+                dtype=torch.float32,
+                device=device,
+            )
+
+        if action_std is not None:
+            self.action_std = torch.as_tensor(
+                action_std,
+                dtype=torch.float32,
+                device=device,
+            )
+
+    def _init_cem_distribution(
+        self,
+        batch_size: int,
+        horizon: int,
+        action_dim: int,
+        prev_action: Optional[np.ndarray],
+        low: float,
+        high: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Initialize CEM from demo action stats and optionally previous executed action.
+
+        This avoids using any future/GT action sequence. It only uses:
+          1) dataset-level action mean/std from the training/eval data distribution,
+          2) previous action actually executed by the planner in the closed loop.
+        """
+        b, h, a = batch_size, horizon, action_dim
+
+        if self.cfg.use_action_prior and self.action_mean is not None and self.action_std is not None:
+            mean = self.action_mean.view(1, 1, a).expand(b, h, a).clone()
+            std = self.action_std.view(1, 1, a).expand(b, h, a).clone()
+            std = std * float(self.cfg.action_prior_std_scale)
+            std = torch.clamp(std, min=float(self.cfg.action_prior_min_std))
+        else:
+            mean = torch.zeros(b, h, a, device=self.device)
+            std = torch.ones(b, h, a, device=self.device)
+
+        if self.cfg.warm_start_mode == "prev_action" and prev_action is not None:
+            prev_action_t = torch.as_tensor(
+                prev_action,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            prev_action_t = torch.clamp(prev_action_t, low, high)
+            prev_mean = prev_action_t[:, None, :].expand(b, h, a).clone()
+
+            mix = float(self.cfg.warm_start_mix)
+            mix = max(0.0, min(1.0, mix))
+            mean = mix * prev_mean + (1.0 - mix) * mean
+
+            warm_std = torch.full_like(std, float(self.cfg.warm_start_std))
+            std = torch.minimum(std, warm_std)
+            std = torch.clamp(std, min=float(self.cfg.cem_min_std))
+
+        mean = torch.clamp(mean, low, high)
+        return mean, std
+
     @torch.no_grad()
-    def plan(self, current_info: Dict[str, np.ndarray], goal_info: Dict[str, np.ndarray]):
+    def plan(
+        self,
+        current_info: Dict[str, np.ndarray],
+        goal_info: Dict[str, np.ndarray],
+        prev_action: Optional[np.ndarray] = None,
+    ):
         vision_hist = _numpy_obs_to_tensor(current_info[self.cfg.vision_key], self.device)
         goal_vision = _numpy_obs_to_tensor(goal_info[self.cfg.vision_key], self.device)
 
         current_t = {self.cfg.vision_key: vision_hist}
         goal_t = {self.cfg.vision_key: goal_vision}
 
-        if self.cfg.use_tactile:
-            current_t[self.cfg.tactile_key] = _numpy_obs_to_tensor(
-                current_info[self.cfg.tactile_key], self.device
-            )
-            goal_t[self.cfg.tactile_key] = _numpy_obs_to_tensor(
-                goal_info[self.cfg.tactile_key], self.device
-            )
-
         b = vision_hist.shape[0]
         h = self.cfg.horizon
         a = self.cfg.action_dim
         s = self.cfg.candidates
 
-        mean = torch.zeros(b, h, a, device=self.device)
-        std = torch.ones(b, h, a, device=self.device)
-
         low = self.cfg.action_low
         high = self.cfg.action_high
+
+        mean, std = self._init_cem_distribution(
+            batch_size=b,
+            horizon=h,
+            action_dim=a,
+            prev_action=prev_action,
+            low=low,
+            high=high,
+        )
 
         final_cost = None
         final_topk_idx = None
@@ -344,7 +381,17 @@ class BatchedCEMPlanner:
                 goal_info=goal_t,
                 sum_all_diffs=self.cfg.sum_all_diffs,
                 discount=self.cfg.discount,
-            )  # [B, S]
+            )
+
+            # Regularize candidate sequences toward demo-like actions.
+            # This helps when the predictor was trained only on GT/demo actions.
+            if self.cfg.action_magnitude_weight > 0:
+                mag_cost = (samples ** 2).mean(dim=(2, 3))
+                cost = cost + float(self.cfg.action_magnitude_weight) * mag_cost
+
+            if self.cfg.action_smooth_weight > 0 and h > 1:
+                smooth_cost = ((samples[:, :, 1:] - samples[:, :, :-1]) ** 2).mean(dim=(2, 3))
+                cost = cost + float(self.cfg.action_smooth_weight) * smooth_cost
 
             topk_idx = torch.topk(cost, k=self.cfg.topk, dim=1, largest=False).indices
             topk_actions = torch.gather(
@@ -354,7 +401,8 @@ class BatchedCEMPlanner:
             )
 
             mean = topk_actions.mean(dim=1)
-            std = topk_actions.std(dim=1, unbiased=False) + 1e-4
+            std = topk_actions.std(dim=1, unbiased=False)
+            std = torch.clamp(std, min=float(self.cfg.cem_min_std))
 
             final_cost = cost
             final_topk_idx = topk_idx

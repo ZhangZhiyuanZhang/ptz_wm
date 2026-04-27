@@ -3,6 +3,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+from dino import DinoEncoder
+from vit import ViTPredictor
 
 
 def init_module_weights(m):
@@ -159,118 +162,11 @@ class ImpalaEncoder(nn.Module):
         x = self.mlp(x)
         x = self.final_ln(x)
         x = x.view(b, t, self.mlp_output_dim).transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        return x
+        return x.contiguous()
 
     def forward(self, x):
         feats = self.forward_features(x)
         return self.project_features(feats)
-
-
-class PointNetEncoderXYZRGB(nn.Module):
-    """
-    Input:  [B, N, C]
-    Output: [B, D]
-
-    Also supports:
-      - forward_features(x) -> [B, N, 512]
-    """
-    def __init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 1024
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-
-        block_channel = [64, 128, 256, 512]
-        self.feature_channels = block_channel[-1]
-
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, block_channel[0]),
-            nn.LayerNorm(block_channel[0]),
-            nn.ReLU(),
-            nn.Linear(block_channel[0], block_channel[1]),
-            nn.LayerNorm(block_channel[1]),
-            nn.ReLU(),
-            nn.Linear(block_channel[1], block_channel[2]),
-            nn.LayerNorm(block_channel[2]),
-            nn.ReLU(),
-            nn.Linear(block_channel[2], block_channel[3]),
-        )
-
-        self.final_projection = nn.Sequential(
-            nn.Linear(block_channel[-1], out_channels),
-            nn.LayerNorm(out_channels),
-        )
-
-        self.out_channels = out_channels
-        self.apply(init_module_weights)
-
-    def forward_features(self, x):
-        """
-        x: [B, N, C]
-        return: [B, N, 512]
-        """
-        x = x[..., :self.in_channels]
-        return self.mlp(x)
-
-    def forward(self, x):
-        x = self.forward_features(x)   # [B, N, 512]
-        feat = torch.max(x, 1)[0]      # [B, 512]
-        feat = self.final_projection(feat)
-        return feat
-
-
-class PointCloudTemporalEncoder(nn.Module):
-    """
-    Wrap point encoder to support both:
-      - token features for attention
-      - pooled latent for non-attention fusion
-
-    Input:  [B, T, N, C]
-    Output:
-      - forward_features(x): [B, C_f, T, N, 1]
-      - forward(x):          [B, D,   T, 1, 1]
-    """
-    def __init__(
-        self,
-        point_encoder: nn.Module,
-        out_dim: int,
-        final_ln: bool = True,
-    ):
-        super().__init__()
-        self.point_encoder = point_encoder
-        self.out_dim = out_dim
-        self.mlp_output_dim = out_dim
-        self.feature_channels = getattr(point_encoder, "feature_channels", 512)
-        self.final_ln = nn.LayerNorm(out_dim) if final_ln else nn.Identity()
-
-    def forward_features(self, x):
-        """
-        x: [B, T, N, C]
-        return: [B, C_f, T, N, 1]
-        """
-        b, t, n, c = x.shape
-        x = x.reshape(b * t, n, c)
-
-        feats = self.point_encoder.forward_features(x)   # [B*T, N, C_f]
-        feats = feats.view(b, t, n, self.feature_channels)
-        feats = feats.permute(0, 3, 1, 2).unsqueeze(-1).contiguous()
-        return feats  # [B, C_f, T, N, 1]
-
-    def forward(self, x):
-        """
-        x: [B, T, N, C]
-        return: [B, D, T, 1, 1]
-        """
-        b, t, n, c = x.shape
-        x = x.reshape(b * t, n, c)
-
-        z = self.point_encoder(x)   # [B*T, D]
-        z = self.final_ln(z)
-        z = z.view(b, t, self.out_dim).transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        return z.contiguous()
 
 
 class RNNPredictor(nn.Module):
@@ -334,328 +230,107 @@ class InverseDynamicsModel(nn.Module):
         return self.model(x)
 
 
-class VisionTactileConcatEncoder(nn.Module):
-    """
-    Standard concat fusion with unified interface.
-    """
-    def __init__(self, vision_encoder: nn.Module, tactile_encoder: nn.Module):
-        super().__init__()
-        self.vision_encoder = vision_encoder
-        self.tactile_encoder = tactile_encoder
 
-    def encode_modalities(self, obs):
-        if not isinstance(obs, dict):
-            raise TypeError("VisionTactileConcatEncoder expects dict obs.")
-        z_v = self.vision_encoder(obs["vision"])
-        z_t = self.tactile_encoder(obs["tactile"])
-        return z_v, z_t
-
-    def fuse_latents(self, z_v, z_t):
-        return torch.cat([z_v, z_t], dim=1)
-
-    def forward(self, obs):
-        z_v, z_t = self.encode_modalities(obs)
-        return self.fuse_latents(z_v, z_t)
-
-
-class VisionTactileGateEncoder(nn.Module):
-    """
-    Vision-anchored gated residual fusion with unified interface.
-    """
+class DinoGridEncoder(nn.Module):
     def __init__(
         self,
-        vision_encoder: nn.Module,
-        tactile_encoder: nn.Module,
-        latent_dim: int,
-        fusion_hidden_dim: Optional[int] = None,
-        final_ln: bool = True,
+        name="dinov2_vits14",
+        feature_key="x_norm_patchtokens",
+        freeze=True,
+        adapter_dim=512,
+        use_adapter=True,
     ):
         super().__init__()
-        self.vision_encoder = vision_encoder
-        self.tactile_encoder = tactile_encoder
-        self.latent_dim = latent_dim
+        self.dino = DinoEncoder(name=name, feature_key=feature_key)
+        self.dino_dim = self.dino.emb_dim
+        self.patch_size = self.dino.patch_size
+        self.freeze = freeze
+        self.use_adapter = use_adapter
+        self.emb_dim = adapter_dim if use_adapter else self.dino_dim
 
-        vdim = getattr(vision_encoder, "mlp_output_dim", latent_dim)
-        tdim = getattr(tactile_encoder, "mlp_output_dim", latent_dim)
-        hidden = fusion_hidden_dim if fusion_hidden_dim is not None else latent_dim
+        if freeze:
+            for p in self.dino.parameters():
+                p.requires_grad = False
+            self.dino.eval()
 
-        self.v_proj = nn.Linear(vdim, latent_dim)
-        self.t_proj = nn.Linear(tdim, latent_dim)
-
-        self.gate = nn.Sequential(
-            nn.Linear(latent_dim * 2, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, latent_dim),
-            nn.Sigmoid(),
-        )
-
-        self.delta = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, latent_dim),
-        )
-
-        self.fusion_ln = nn.LayerNorm(latent_dim) if final_ln else nn.Identity()
-        self.apply(init_module_weights)
-
-    def encode_modalities(self, obs):
-        if not isinstance(obs, dict):
-            raise TypeError("VisionTactileGateEncoder expects dict obs.")
-        z_v = self.vision_encoder(obs["vision"])
-        z_t = self.tactile_encoder(obs["tactile"])
-        return z_v, z_t
-
-    def fuse_latents(self, z_v, z_t):
-        v = z_v.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()  # [B,T,Dv]
-        t = z_t.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()  # [B,T,Dt]
-
-        v = self.v_proj(v)
-        t = self.t_proj(t)
-
-        joint = torch.cat([v, t], dim=-1)
-        g = self.gate(joint)
-        d = self.delta(t)
-
-        fused = v + g * d
-        fused = self.fusion_ln(fused)
-        fused = fused.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        return fused.contiguous()
-
-    def forward(self, obs):
-        z_v, z_t = self.encode_modalities(obs)
-        return self.fuse_latents(z_v, z_t)
-
-
-class VisionTactileFiLMEncoder(nn.Module):
-    """
-    FiLM fusion with unified interface.
-    """
-    def __init__(
-        self,
-        vision_encoder: nn.Module,
-        tactile_encoder: nn.Module,
-        latent_dim: int,
-        fusion_hidden_dim: Optional[int] = None,
-        final_ln: bool = True,
-    ):
-        super().__init__()
-        self.vision_encoder = vision_encoder
-        self.tactile_encoder = tactile_encoder
-        self.latent_dim = latent_dim
-
-        vdim = getattr(vision_encoder, "mlp_output_dim", latent_dim)
-        tdim = getattr(tactile_encoder, "mlp_output_dim", latent_dim)
-        hidden = fusion_hidden_dim if fusion_hidden_dim is not None else latent_dim
-
-        self.v_proj = nn.Linear(vdim, latent_dim)
-        self.t_proj = nn.Linear(tdim, latent_dim)
-
-        self.gamma_mlp = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, latent_dim),
-        )
-        self.beta_mlp = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, latent_dim),
-        )
-
-        self.fusion_ln = nn.LayerNorm(latent_dim) if final_ln else nn.Identity()
-        self.apply(init_module_weights)
-
-    def encode_modalities(self, obs):
-        if not isinstance(obs, dict):
-            raise TypeError("VisionTactileFiLMEncoder expects dict obs.")
-        z_v = self.vision_encoder(obs["vision"])
-        z_t = self.tactile_encoder(obs["tactile"])
-        return z_v, z_t
-
-    def fuse_latents(self, z_v, z_t):
-        v = z_v.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
-        t = z_t.squeeze(-1).squeeze(-1).transpose(1, 2).contiguous()
-
-        v = self.v_proj(v)
-        t = self.t_proj(t)
-
-        gamma = self.gamma_mlp(t)
-        beta = self.beta_mlp(t)
-
-        fused = (1.0 + gamma) * v + beta
-        fused = self.fusion_ln(fused)
-        fused = fused.transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        return fused.contiguous()
-
-    def forward(self, obs):
-        z_v, z_t = self.encode_modalities(obs)
-        return self.fuse_latents(z_v, z_t)
-
-
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
-        super().__init__()
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        hidden = int(d_model * mlp_ratio)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, q, kv):
-        q2 = self.norm_q(q)
-        kv2 = self.norm_kv(kv)
-        attn_out, _ = self.attn(q2, kv2, kv2, need_weights=False)
-        x = q + attn_out
-        x = x + self.ffn(x)
-        return x
-
-
-class VisionTactileAttnEncoder(nn.Module):
-    """
-    Your original token-level cross-attention fusion.
-    Reused directly as the attn feature-fusion module.
-    """
-    def __init__(
-        self,
-        vision_encoder: nn.Module,
-        tactile_encoder: nn.Module,
-        latent_dim: int,
-        final_ln: bool = True,
-        attn_d_model: int = 256,
-        attn_heads: int = 4,
-        attn_layers: int = 2,
-        attn_mlp_ratio: float = 4.0,
-        attn_dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.vision_encoder = vision_encoder
-        self.tactile_encoder = tactile_encoder
-        self.latent_dim = latent_dim
-        self.output_dim = latent_dim
-
-        cv = vision_encoder.feature_channels
-        ct = tactile_encoder.feature_channels
-
-        self.v_proj = nn.Linear(cv, attn_d_model)
-        self.t_proj = nn.Linear(ct, attn_d_model)
-
-        self.blocks = nn.ModuleList([
-            CrossAttentionBlock(
-                d_model=attn_d_model,
-                n_heads=attn_heads,
-                mlp_ratio=attn_mlp_ratio,
-                dropout=attn_dropout,
+        if use_adapter:
+            self.adapter = nn.Sequential(
+                nn.LayerNorm(self.dino_dim),
+                nn.Linear(self.dino_dim, adapter_dim),
+                nn.GELU(),
+                nn.Linear(adapter_dim, adapter_dim),
+                nn.LayerNorm(adapter_dim),
             )
-            for _ in range(attn_layers)
-        ])
+        else:
+            self.adapter = nn.Identity()
 
-        self.head = nn.Linear(attn_d_model, latent_dim)
-        self.fusion_ln = nn.LayerNorm(latent_dim) if final_ln else nn.Identity()
-        self.apply(init_module_weights)
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        b, c, t, h, w = x.shape
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
 
-    def _fuse_from_features(self, v_feats, t_feats):
-        b, cv, t, hv, wv = v_feats.shape
-        _, ct, _, ht, wt = t_feats.shape
+        if self.freeze:
+            with torch.no_grad():
+                z = self.dino(x)
+        else:
+            z = self.dino(x)
 
-        v_tokens = v_feats.permute(0, 2, 3, 4, 1).contiguous().view(b * t, hv * wv, cv)
-        t_tokens = t_feats.permute(0, 2, 3, 4, 1).contiguous().view(b * t, ht * wt, ct)
-
-        v_tokens = self.v_proj(v_tokens)
-        t_tokens = self.t_proj(t_tokens)
-
-        for blk in self.blocks:
-            v_tokens = blk(v_tokens, t_tokens)
-
-        pooled = v_tokens.mean(dim=1)
-        fused = self.head(pooled)
-        fused = self.fusion_ln(fused)
-        fused = fused.view(b, t, self.latent_dim).transpose(1, 2).unsqueeze(-1).unsqueeze(-1)
-        return fused.contiguous()
-
-    def encode_modalities(self, obs):
-        if not isinstance(obs, dict):
-            raise TypeError("VisionTactileAttnEncoder expects dict obs.")
-        v_feats = self.vision_encoder.forward_features(obs["vision"])
-        t_feats = self.tactile_encoder.forward_features(obs["tactile"])
-        return v_feats, t_feats
-
-    def fuse_latents(self, z_v, z_t):
-        return self._fuse_from_features(z_v, z_t)
-
-    def forward(self, obs):
-        v_feats, t_feats = self.encode_modalities(obs)
-        return self.fuse_latents(v_feats, t_feats)
+        # z: [B*T, P, dino_dim]
+        z = self.adapter(z)  # [B*T, P, adapter_dim]
+        z = z.reshape(b, t, z.shape[1], z.shape[2])
+        return z.contiguous()
 
 
-def build_vision_tactile_encoder(
-    fusion_type,
-    vision_encoder,
-    tactile_encoder,
-    vision_dim,
-    tactile_dim,
-    fusion_latent_dim=None,
-    fusion_hidden_dim=None,
-    attn_d_model=256,
-    attn_heads=4,
-    attn_layers=2,
-    attn_mlp_ratio=4.0,
-    attn_dropout=0.0,
-):
-    fusion_type = fusion_type.lower()
 
-    if fusion_type == "concat":
-        encoder = VisionTactileConcatEncoder(
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
+class DINOViTPredictor(nn.Module):
+    """
+    Input:
+        z:      [B, T, P, D]
+        action: [B, T, A]
+    Output:
+        pred:   [B, T, P, D]
+    """
+    def __init__(
+        self,
+        num_patches: int,
+        num_frames: int,
+        dim: int,
+        action_dim: int,
+        depth: int = 6,
+        heads: int = 6,
+        mlp_dim: int = 1536,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.num_patches = num_patches
+        self.num_frames = num_frames
+        self.dim = dim
+
+        self.action_proj = nn.Linear(action_dim, dim)
+
+        self.predictor = ViTPredictor(
+            num_patches=num_patches,
+            num_frames=num_frames,
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            mlp_dim=mlp_dim,
+            dim_head=dim_head,
+            dropout=dropout,
+            emb_dropout=dropout,
+            use_sdpa=True,
         )
-        return encoder, vision_dim + tactile_dim
 
-    if fusion_type == "gate":
-        latent_dim = fusion_latent_dim if fusion_latent_dim is not None else vision_dim
-        encoder = VisionTactileGateEncoder(
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
-            latent_dim=latent_dim,
-            fusion_hidden_dim=fusion_hidden_dim,
-            final_ln=True,
-        )
-        return encoder, latent_dim
+    def forward(self, z, action):
+        # z: [B,T,P,D]
+        # action: [B,T,A]
+        B, T, P, D = z.shape
 
-    if fusion_type == "film":
-        latent_dim = fusion_latent_dim if fusion_latent_dim is not None else vision_dim
-        encoder = VisionTactileFiLMEncoder(
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
-            latent_dim=latent_dim,
-            fusion_hidden_dim=fusion_hidden_dim,
-            final_ln=True,
-        )
-        return encoder, latent_dim
+        a = self.action_proj(action).unsqueeze(2)  # [B,T,1,D]
+        x = z + a                                  # [B,T,P,D]
 
-    if fusion_type == "attn":
-        latent_dim = fusion_latent_dim if fusion_latent_dim is not None else vision_dim
-        encoder = VisionTactileAttnEncoder(
-            vision_encoder=vision_encoder,
-            tactile_encoder=tactile_encoder,
-            latent_dim=latent_dim,
-            final_ln=True,
-            attn_d_model=attn_d_model,
-            attn_heads=attn_heads,
-            attn_layers=attn_layers,
-            attn_mlp_ratio=attn_mlp_ratio,
-            attn_dropout=attn_dropout,
-        )
-        return encoder, latent_dim
-
-    raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+        x = x.reshape(B, T * P, D)
+        y = self.predictor(x)
+        y = y.reshape(B, T, P, D)
+        return y
