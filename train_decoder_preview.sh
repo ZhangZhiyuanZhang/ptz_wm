@@ -6,6 +6,6 @@ python train_decoder.py \
   --num-steps 5 \
   --batch-size 8 \
   --num-workers 2 \
-  --ckpt-path logs/decoder_ckpts/image_dinov2_vits14_decoder/last.ckpt \
+  --ckpt-path logs/decoder_ckpts/image_dinov2_vits14_decoder/015000.ckpt \
   --preview-only \
-  --preview-path decoder_preview/recon.png
+  --preview-path decoder_preview/recon_15k.png

@@ -361,7 +361,17 @@ def main():
         log_every_n_steps=10,
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    ckpt_dir = f"{args.save_dir}/{exp_name}"
+    last_ckpt = os.path.join(ckpt_dir, "last.ckpt")
+
+    if os.path.exists(last_ckpt):
+        print(f"[INFO] Resuming from {last_ckpt}")
+        ckpt_path = last_ckpt
+    else:
+        print("[INFO] No checkpoint found, training from scratch")
+        ckpt_path = None
+
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":

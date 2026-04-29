@@ -12,5 +12,5 @@ python train.py \
   --pred-mlp-ratio 4.0 \
   --batch-size 32 \
   --num-workers 4 \
-  --epochs 600 \
+  --epochs 1000 \
   --wandb
