@@ -274,6 +274,10 @@ def main() -> None:
 
     parser.add_argument("--encoder-type", type=str, default="dino", choices=["impala", "dino"])
     parser.add_argument("--predictor-type", type=str, default="vit", choices=["rnn", "vit"])
+    parser.add_argument("--discrete-action", action="store_true", default=True,
+                        help="Use discrete PTZ action sampling in {-1,0,1}.")
+    parser.add_argument("--continuous-action", dest="discrete_action", action="store_false",
+                        help="Use the original continuous Gaussian CEM sampling.")
 
     parser.add_argument("--stop-on-success", action="store_true")
 
@@ -360,6 +364,7 @@ def main() -> None:
         sim_t_after_proj=args.sim_t_after_proj,
         encoder_type=args.encoder_type,
         predictor_type=args.predictor_type,
+        discrete_action=args.discrete_action,
     )
 
     model = build_model(planner_cfg)

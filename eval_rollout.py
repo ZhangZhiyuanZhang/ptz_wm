@@ -20,6 +20,7 @@ def compute_rollout_errors(
     max_rollout=6,
     device="cuda",
     action_mode="gt",
+    discrete_action=True,
 ):
     model.eval()
     step_errors = {k: [] for k in range(1, max_rollout + 1)}
@@ -38,7 +39,12 @@ def compute_rollout_errors(
         if action_mode == "gt":
             act_used = act
         elif action_mode == "random_uniform":
-            act_used = 2.0 * torch.rand_like(act) - 1.0
+            if discrete_action:
+                values = torch.tensor([-1.0, 0.0, 1.0], device=act.device, dtype=act.dtype)
+                idx = torch.randint(0, values.numel(), act.shape, device=act.device)
+                act_used = values[idx]
+            else:
+                act_used = 2.0 * torch.rand_like(act) - 1.0
         elif action_mode == "zero":
             act_used = torch.zeros_like(act)
         else:
@@ -84,6 +90,7 @@ def compute_rollout_errors_for_modes(
     max_rollout=6,
     device="cuda",
     modes=None,
+    discrete_action=True,
 ):
     if modes is None:
         modes = ["gt", "random_uniform", "zero"]
@@ -97,6 +104,7 @@ def compute_rollout_errors_for_modes(
             max_rollout=max_rollout,
             device=device,
             action_mode=mode,
+            discrete_action=discrete_action,
         )
     return out
 
@@ -188,6 +196,10 @@ def parse_args():
 
     parser.add_argument("--encoder-type", type=str, default="dino", choices=["impala", "dino"])
     parser.add_argument("--predictor-type", type=str, default="vit", choices=["rnn", "vit"])
+    parser.add_argument("--discrete-action", action="store_true", default=True,
+                        help="Use discrete random actions in {-1,0,1} for random_uniform rollout.")
+    parser.add_argument("--continuous-action", dest="discrete_action", action="store_false",
+                        help="Use continuous random actions in [-1,1] for random_uniform rollout.")
 
     return parser.parse_args()
 
@@ -265,6 +277,7 @@ def main():
             max_rollout=args.max_rollout,
             device=device,
             modes=["gt", "random_uniform", "zero"],
+            discrete_action=args.discrete_action,
         )
     else:
         metrics = {
@@ -275,6 +288,7 @@ def main():
                 max_rollout=args.max_rollout,
                 device=device,
                 action_mode=args.action_mode,
+                discrete_action=args.discrete_action,
             )
         }
 

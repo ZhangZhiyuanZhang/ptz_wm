@@ -81,6 +81,9 @@ class PlannerConfig:
     encoder_type: str = "dino"
     predictor_type: str = "vit"
 
+    # PTZ actions are discrete commands, usually each dim in {-1, 0, 1}.
+    discrete_action: bool = True
+
 
 def build_vision_encoder(cfg):
     return ImpalaEncoder(
@@ -370,10 +373,29 @@ class BatchedCEMPlanner:
         final_topk_idx = None
         final_topk_actions = None
 
+        values = torch.tensor([-1.0, 0.0, 1.0], device=self.device)
+
         for _ in range(self.cfg.iterations):
-            noise = torch.randn(b, s, h, a, device=self.device)
-            samples = mean[:, None] + std[:, None] * noise
-            samples = torch.clamp(samples, low, high)
+            if self.cfg.discrete_action:
+                # Sample valid PTZ commands from {-1, 0, 1} instead of fractional Gaussian actions.
+                idx = torch.randint(
+                    low=0,
+                    high=values.numel(),
+                    size=(b, s, h, a),
+                    device=self.device,
+                )
+                samples = values[idx]
+
+                # Optionally warm-start a subset of candidates with the previous executed action.
+                if self.cfg.warm_start_mode == "prev_action" and prev_action is not None and s > 1:
+                    prev_action_t = torch.as_tensor(prev_action, dtype=torch.float32, device=self.device)
+                    prev_action_t = torch.round(torch.clamp(prev_action_t, low, high))
+                    n_warm = max(1, int(s * float(self.cfg.warm_start_mix)))
+                    samples[:, :n_warm] = prev_action_t[:, None, None, :].expand(b, n_warm, h, a)
+            else:
+                noise = torch.randn(b, s, h, a, device=self.device)
+                samples = mean[:, None] + std[:, None] * noise
+                samples = torch.clamp(samples, low, high)
 
             cost = self.model.get_cost(
                 current_info=current_t,

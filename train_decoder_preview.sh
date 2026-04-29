@@ -1,0 +1,11 @@
+python train_decoder.py \
+  --data-root /home/zhiyuan/Project/ptz_wm/data/replay_buffer.zarr \
+  --vision-key image \
+  --dino-name dinov2_vits14 \
+  --image-size 224 \
+  --num-steps 5 \
+  --batch-size 8 \
+  --num-workers 2 \
+  --ckpt-path logs/decoder_ckpts/image_dinov2_vits14_decoder/last.ckpt \
+  --preview-only \
+  --preview-path decoder_preview/recon.png
