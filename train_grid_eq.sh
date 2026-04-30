@@ -7,10 +7,8 @@ python train.py \
   --num-steps 5 \
   --nsteps 1 \
   --dino-name dinov2_vits14 \
-  --pred-depth 6 \
-  --pred-heads 6 \
-  --pred-mlp-ratio 4.0 \
   --eq-weight 0.05 \
+  --backward-weight 0.1 \
   --batch-size 32 \
   --num-workers 4 \
   --epochs 600 \

@@ -55,6 +55,10 @@ class JointTrainingModule(pl.LightningModule):
         
         if "eq_loss" in out:
             self.log("train/eq_loss", out["eq_loss"], prog_bar=True, on_step=True, on_epoch=True)
+        
+        if "backward_loss" in out:
+            self.log("train/backward_loss", out["backward_loss"], prog_bar=True, on_step=True, on_epoch=True)
+
         return out["loss"]
 
     def validation_step(self, batch, batch_idx):
@@ -67,6 +71,9 @@ class JointTrainingModule(pl.LightningModule):
         
         if "eq_loss" in out:
             self.log("val/eq_loss", out["eq_loss"], prog_bar=True, on_step=False, on_epoch=True)
+
+        if "backward_loss" in out:
+            self.log("val/backward_loss", out["backward_loss"], prog_bar=True, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]
@@ -171,7 +178,8 @@ def parse_args():
     parser.add_argument("--encoder-type", type=str, default="dino", choices=["impala", "dino"])
     parser.add_argument("--predictor-type", type=str, default="vit", choices=["rnn", "vit"])
     parser.add_argument("--eq-weight", type=float, default=0.0)
-
+    parser.add_argument("--backward-weight", type=float, default=0.0)
+    
     return parser.parse_args()
 
 def build_regularizer(reg_hidden_dim: int, action_dim: int, args):
@@ -285,6 +293,7 @@ def build_model(args, action_dim: int) -> WorldModel:
             latent_type="grid",
             grid_size=grid_size,
             eq_weight=args.eq_weight,
+            backward_weight=args.backward_weight,
         )
 
 

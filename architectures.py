@@ -237,7 +237,7 @@ class DinoGridEncoder(nn.Module):
         name="dinov2_vits14",
         feature_key="x_norm_patchtokens",
         freeze=True,
-        adapter_dim=512,
+        adapter_dim=384,
         use_adapter=True,
     ):
         super().__init__()

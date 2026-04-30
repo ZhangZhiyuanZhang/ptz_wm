@@ -77,6 +77,7 @@ class PlannerConfig:
     pred_embed_dim: int = 384
     pred_mlp_ratio: float = 4.0
     eq_weight: float = 0.0
+    backward_weight=0.0
 
     encoder_type: str = "dino"
     predictor_type: str = "vit"
@@ -166,6 +167,7 @@ def build_model(cfg: PlannerConfig) -> WorldModel:
             latent_type="vector",
             grid_size=None,
             eq_weight=0.0,
+            backward_weight=0.0,
         )
 
     if cfg.encoder_type == "dino":
@@ -204,7 +206,8 @@ def build_model(cfg: PlannerConfig) -> WorldModel:
             vision_dim=vision_dim,
             latent_type="grid",
             grid_size=grid_size,
-            eq_weight=cfg.eq_weight,
+            eq_weight=0.0,
+            backward_weight=0.0,
         )
 
 

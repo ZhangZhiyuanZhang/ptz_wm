@@ -102,6 +102,7 @@ class WorldModel(nn.Module):
         vision_dim: int = 512,
         grid_size: int = 16,
         eq_weight: float = 0.0,
+        backward_weight: float = 0.0,
         latent_type: str = "grid",
     ):
         super().__init__()
@@ -113,6 +114,7 @@ class WorldModel(nn.Module):
         self.predictor = predictor
         self.grid_size = grid_size
         self.eq_weight = eq_weight
+        self.backward_weight = backward_weight
 
         self.latent_type = latent_type
 
@@ -204,11 +206,12 @@ class WorldModel(nn.Module):
         a: [B,T,A]
 
         Assumption:
-        a[..., 0] = pan/yaw-like horizontal action
-        a[..., 1] = tilt/pitch-like vertical action
-        a[..., 2] = zoom, unchanged
+        a[..., 0] = pan delta
+        a[..., 1] = tilt delta
+        a[..., 2] = zoom delta, unchanged by flip
+        a[..., 3] = focus delta, unchanged by flip
 
-        If your action dim > 3, remaining dims are kept unchanged.
+        Only pan/tilt are transformed.
         """
         if a.size(-1) < 2:
             return a
@@ -279,34 +282,35 @@ class WorldModel(nn.Module):
             pred = self.predictor(z_in, a_in)
             pred_loss = F.mse_loss(pred, target)
 
-            # Equivariance loss:
-            # P(tau(z), tau_a(a)) ~= tau(P(z, a))
-            if self.eq_weight > 0.0:
-                flip = random.choice([None, "h", "v"])
-                angle = random.choice([0, 1, 2, 3])
+            eq_loss = z.new_tensor(0.0)
+            backward_loss = z.new_tensor(0.0)
 
-                z_tau = self.transform_grid_tokens(z_in, flip=flip, angle=angle)
-                a_tau = self.transform_ptz_action(a_in, flip=flip, angle=angle)
+            if self.eq_weight > 0 or self.backward_weight > 0:
+                if random.random() < 0.5 and self.eq_weight > 0:
+                    # only run eq this batch
+                    flip = random.choice([None, "h", "v"])
+                    angle = 0
+                    z_tau = self.transform_grid_tokens(z_in, flip=flip, angle=angle)
+                    a_tau = self.transform_ptz_action(a_in, flip=flip, angle=angle)
+                    pred_tau = self.predictor(z_tau, a_tau)
+                    pred_expected = self.transform_grid_tokens(pred.detach(), flip=flip, angle=angle)
+                    eq_loss = F.mse_loss(pred_tau, pred_expected)
+                elif self.backward_weight > 0:
+                    # only run backward this batch
+                    inv_a = -a_in
+                    pred_backward = self.predictor(target.detach(), inv_a)
+                    backward_loss = F.mse_loss(pred_backward, z_in.detach())
 
-                pred_tau = self.predictor(z_tau, a_tau)
-                pred_expected = self.transform_grid_tokens(
-                    pred.detach(),
-                    flip=flip,
-                    angle=angle,
-                )
-
-                eq_loss = F.mse_loss(pred_tau, pred_expected)
-            else:
-                eq_loss = z.new_tensor(0.0)
+            total_loss = pred_loss + self.eq_weight * eq_loss + self.backward_weight * backward_loss
 
             reg_loss = z.new_tensor(0.0)
-            total_loss = pred_loss + self.eq_weight * eq_loss
 
             return {
                 "loss": total_loss,
                 "pred_loss": pred_loss,
                 "reg_loss": reg_loss,
                 "eq_loss": eq_loss,
+                "backward_loss": backward_loss,
                 "reg_dict": {},
             }
         else:

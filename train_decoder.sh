@@ -1,13 +1,11 @@
 python train_decoder.py \
-  --data-root /home/zhiyuan/Project/ptz_wm/data/replay_buffer.zarr \
+  --data-root data/replay_buffer.zarr \
   --vision-key image \
+  --wm-ckpt-path logs/ckpts/image_dino_vit/100000.ckpt \
+  --encoder-type dino \
+  --predictor-type vit \
   --dino-name dinov2_vits14 \
   --image-size 224 \
   --num-steps 5 \
   --batch-size 32 \
-  --num-workers 4 \
-  --epochs 100 \
-  --lr 1e-4 \
-  --save-dir logs/decoder_ckpts \
-  --ckpt-every-n-steps 5000 \
-  --wandb
+  --epochs 200

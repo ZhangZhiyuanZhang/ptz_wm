@@ -2,28 +2,34 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import zarr
-from PIL import Image
-
-from planner_utils import PlannerConfig, build_model, load_lightning_ckpt
-from train_decoder import DINOImageDecoderModule
 from PIL import Image, ImageDraw, ImageFont
 
+from planner_utils import PlannerConfig, build_model, load_lightning_ckpt
+from train_decoder import WMDecoderModule
+
+
 ACTION_MAP = {
-    "left":  [-1,  0,  0,  0],
-    "right": [ 1,  0,  0,  0],
-    "up":    [ 0, -1,  0,  0],
-    "down":  [ 0, 1,  0,  0],
-    "zero":  [ 0,  0,  0,  0],
+    "left":   [-1,  0,  0,  0],
+    "right":  [1,  0,  0,  0],
+    "up":     [0, -1,  0,  0],
+    "down":   [0,  1,  0,  0],
+    "zoom+":  [0,  0,  1,  0],
+    "zoom-":  [0,  0, -1,  0],
+    "focus+": [0,  0,  0,  1],
+    "focus-": [0,  0,  0, -1],
+    "zero":   [0,  0,  0,  0],
 }
+
 
 def action_to_label(a):
     pan, tilt, zoom, focus = [int(x) for x in a]
-
     parts = []
+
     if pan < 0:
         parts.append("LEFT")
     elif pan > 0:
@@ -44,28 +50,20 @@ def action_to_label(a):
     elif focus < 0:
         parts.append("FOCUS-")
 
-    if len(parts) == 0:
-        return "ZERO"
-
-    return " + ".join(parts)
+    return "ZERO" if len(parts) == 0 else " + ".join(parts)
 
 
 def draw_action_overlay(frame_uint8, action=None, step_idx=0):
-    """
-    frame_uint8: [H,W,3], uint8
-    action: [4] or None
-    """
     img = Image.fromarray(frame_uint8)
     draw = ImageDraw.Draw(img)
 
-    w, h = img.size
+    w, _ = img.size
 
     if action is None:
         label = "Initial"
     else:
         label = f"Step {step_idx}: {action_to_label(action)}  action={list(map(int, action))}"
 
-    # background box
     box_h = 34
     draw.rectangle([0, 0, w, box_h], fill=(0, 0, 0))
 
@@ -76,30 +74,28 @@ def draw_action_overlay(frame_uint8, action=None, step_idx=0):
 
     draw.text((10, 7), label, fill=(255, 255, 255), font=font)
 
-    # draw arrow
     if action is not None:
         pan, tilt, _, _ = [int(x) for x in action]
         cx, cy = w // 2, box_h + 35
         scale = 35
-
         dx = pan * scale
         dy = tilt * scale
 
         if dx != 0 or dy != 0:
             x2, y2 = cx + dx, cy + dy
             draw.line([cx, cy, x2, y2], fill=(255, 0, 0), width=5)
-
-            # arrow head
             r = 8
             draw.ellipse([x2 - r, y2 - r, x2 + r, y2 + r], fill=(255, 0, 0))
 
     return np.asarray(img)
 
+
 def parse_action_sequence(action_str: str):
     """
     Examples:
-      "right right up left"
-      "right:5 up:3 left:2 down:1"
+        "right right up left"
+        "right:5 up:3 left:2 down:1"
+        "right:10 zoom+:5 zero:3"
     """
     actions = []
     tokens = action_str.replace(",", " ").split()
@@ -130,49 +126,84 @@ def load_image_from_zarr(data_root: str, vision_key: str, init_index: int):
     else:
         img_float = img.astype(np.float32)
 
-    # HWC -> CHW
     if img_float.ndim == 3 and img_float.shape[-1] in (1, 3):
-        img_float_chw = np.transpose(img_float, (2, 0, 1))
+        img_chw = np.transpose(img_float, (2, 0, 1))
     elif img_float.ndim == 3 and img_float.shape[0] in (1, 3):
-        img_float_chw = img_float
+        img_chw = img_float
     else:
         raise ValueError(f"Unsupported image shape: {img_float.shape}")
 
-    # [C,H,W] -> [B,T,C,H,W]
-    img_batch = torch.from_numpy(img_float_chw)[None, None].float()
-
+    img_batch = torch.from_numpy(img_chw)[None, None].float()
     return img_float, img_batch
 
 
 def tensor_to_uint8(img):
-    """
-    img: [3,H,W], range [0,1]
-    """
     img = img.detach().cpu().clamp(0, 1)
     img = img.permute(1, 2, 0).numpy()
-    img = (img * 255).astype(np.uint8)
-    return img
+    return (img * 255).astype(np.uint8)
+
+
+def make_wm_args(args):
+    """
+    These args must match train_decoder.py / train.py build_model requirements.
+    """
+    return SimpleNamespace(
+        # model
+        encoder_type="dino",
+        predictor_type="vit",
+        vision_key=args.vision_key,
+        image_size=args.image_size,
+        vision_dim=args.vision_dim,
+        dino_name=args.dino_name,
+        num_steps=args.num_steps,
+        pred_depth=args.pred_depth,
+        pred_heads=args.pred_heads,
+        pred_embed_dim=args.pred_embed_dim,
+        pred_mlp_ratio=args.pred_mlp_ratio,
+        eq_weight=args.eq_weight,
+
+        # dummy training args used by JointTrainingModule init
+        lr=1e-4,
+        weight_decay=1e-4,
+        nsteps=args.nsteps,
+
+        # dummy regularizer args, not used for dino grid WM
+        reg_loss_type="vc",
+        use_proj=False,
+        cov_coeff=1.0,
+        std_coeff=1.0,
+        sigreg_coeff=0.1,
+        sigreg_knots=17,
+        sigreg_num_proj=1024,
+        sim_coeff_t=0.1,
+        idm_coeff=0.1,
+        idm_after_proj=False,
+        sim_t_after_proj=False,
+    )
 
 
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--wm-ckpt", type=str, default="logs/ckpts/image_dino_vit/last.ckpt")
-    parser.add_argument("--decoder-ckpt", type=str, default="logs/decoder_ckpts/image_dinov2_vits14_decoder/last.ckpt")
-    parser.add_argument("--data-root", type=str, default="data/replay_buffer.zarr")
+    parser.add_argument("--wm-ckpt", type=str, required=True)
+    parser.add_argument("--decoder-ckpt", type=str, required=True)
+    parser.add_argument("--data-root", type=str, required=True)
     parser.add_argument("--vision-key", type=str, default="image")
     parser.add_argument("--init-index", type=int, default=0)
 
     parser.add_argument("--actions", type=str, default="right:10 up:5 left:5 down:5")
 
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--vision-dim", type=int, default=512)
     parser.add_argument("--dino-name", type=str, default="dinov2_vits14")
     parser.add_argument("--num-steps", type=int, default=5)
+    parser.add_argument("--nsteps", type=int, default=2)
     parser.add_argument("--pred-depth", type=int, default=6)
     parser.add_argument("--pred-heads", type=int, default=6)
     parser.add_argument("--pred-embed-dim", type=int, default=384)
     parser.add_argument("--pred-mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--eq-weight", type=float, default=0.0)
 
     parser.add_argument("--output-dir", type=str, default="interactive_rollout_outputs")
     parser.add_argument("--fps", type=int, default=5)
@@ -187,6 +218,7 @@ def main():
     actions_np = parse_action_sequence(args.actions)
     action_dim = actions_np.shape[-1]
 
+    # Load WM for rollout
     cfg = PlannerConfig(
         action_dim=action_dim,
         vision_key=args.vision_key,
@@ -206,54 +238,67 @@ def main():
     wm = wm.to(device).eval()
     wm.requires_grad_(False)
 
-    decoder_module = DINOImageDecoderModule(
-        dino_name=args.dino_name,
+    # Load predictor-aware decoder module
+    wm_args = make_wm_args(args)
+    decoder_module = WMDecoderModule(
+        wm_args=wm_args,
+        action_dim=action_dim,
+        wm_ckpt_path=args.wm_ckpt,
         vision_key=args.vision_key,
         image_size=args.image_size,
+        lr=1e-4,
+        weight_decay=1e-4,
     )
 
     ckpt = torch.load(args.decoder_ckpt, map_location="cpu")
     state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-    decoder_module.load_state_dict(state_dict, strict=False)
+    missing, unexpected = decoder_module.load_state_dict(state_dict, strict=False)
+
+    print(f"[INFO] Loaded decoder checkpoint: {args.decoder_ckpt}")
+    print(f"[INFO] Decoder missing keys: {len(missing)}")
+    print(f"[INFO] Decoder unexpected keys: {len(unexpected)}")
+
     decoder_module = decoder_module.to(device).eval()
     decoder_module.requires_grad_(False)
+    decoder = decoder_module.decoder
 
-    raw_img, img_batch = load_image_from_zarr(
+    _, img_batch = load_image_from_zarr(
         data_root=args.data_root,
         vision_key=args.vision_key,
         init_index=args.init_index,
     )
 
     batch = {
-        args.vision_key: img_batch.to(device)
+        args.vision_key: img_batch.to(device),
     }
 
-    z = wm.encode(batch)          # [1,1,256,384]
+    # Initial latent from real image
+    z = wm.encode(batch)  # [1,1,P,D]
     z_hist = z.clone()
 
     decoded_frames = []
 
-    # frame 0: decoder reconstruction from initial image latent
-    init_recon = decoder_module.decoder(z_hist)[:, 0]  # [1,3,H,W]
+    # Frame 0: decode initial encoder latent
+    init_recon = decoder(z_hist)[:, 0]  # [1,3,H,W]
     frame0 = tensor_to_uint8(init_recon[0])
     frame0 = draw_action_overlay(frame0, action=None, step_idx=0)
     decoded_frames.append(frame0)
 
+    # Autoregressive latent rollout
     for t, a_np in enumerate(actions_np):
-        a = torch.from_numpy(a_np)[None, None].to(device)  # [1,1,4]
+        a = torch.from_numpy(a_np)[None, None].to(device)  # [1,1,A]
+
         z_next = wm.predict_sequence(z_hist[:, -1:], a)[:, -1:]  # [1,1,P,D]
         z_hist = torch.cat([z_hist, z_next], dim=1)
 
-        pred_img = decoder_module.decoder(z_next)[:, 0]
+        pred_img = decoder(z_next)[:, 0]  # [1,3,H,W]
         frame = tensor_to_uint8(pred_img[0])
         frame = draw_action_overlay(frame, action=a_np, step_idx=t + 1)
         decoded_frames.append(frame)
 
-    # save frames
     for i, frame in enumerate(decoded_frames):
         Image.fromarray(frame).save(frames_dir / f"frame_{i:04d}.png")
 
-    # save mp4 if imageio is available
     try:
         import imageio.v2 as imageio
         video_path = out_dir / "rollout.mp4"
