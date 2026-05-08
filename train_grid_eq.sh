@@ -4,11 +4,13 @@ python train.py \
   --encoder-type dino \
   --predictor-type vit \
   --image-size 224 \
+  --dino-adapter-type equi \
+  --equi-N 4 \
   --num-steps 5 \
   --nsteps 1 \
   --dino-name dinov2_vits14 \
-  --eq-weight 0.05 \
-  --backward-weight 0.1 \
+  --eq-weight 0.0 \
+  --backward-weight 0.0 \
   --batch-size 32 \
   --num-workers 4 \
   --epochs 600 \

@@ -229,7 +229,79 @@ class InverseDynamicsModel(nn.Module):
         x = torch.cat([state_t, state_tp1], dim=-1)
         return self.model(x)
 
+from escnn import gspaces, nn as enn
 
+
+class EquivariantAdapter(nn.Module):
+    """
+    DINO grid tokens -> equivariant conv adapter -> grid tokens.
+
+    Input:  [B, P, D]
+    Output: [B, P, D]
+    """
+    def __init__(self, dim=384, grid_size=16, N=4, hidden=48):
+        super().__init__()
+        self.dim = dim
+        self.grid_size = grid_size
+        self.N = N
+        self.hidden = hidden
+
+        assert hidden * N == dim, (
+            f"hidden * N must equal dim, got hidden={hidden}, N={N}, dim={dim}"
+        )
+
+        self.group = gspaces.rot2dOnR2(N)
+
+        self.in_type = enn.FieldType(
+            self.group,
+            dim * [self.group.trivial_repr],
+        )
+
+        self.hid_type = enn.FieldType(
+            self.group,
+            hidden * [self.group.regular_repr],
+        )
+
+        self.adapter = enn.SequentialModule(
+            enn.R2Conv(
+                self.in_type,
+                self.hid_type,
+                kernel_size=3,
+                padding=1,
+                initialize=True,
+            ),
+            enn.ReLU(self.hid_type, inplace=True),
+
+            enn.R2Conv(
+                self.hid_type,
+                self.hid_type,
+                kernel_size=3,
+                padding=1,
+                initialize=True,
+            ),
+            enn.ReLU(self.hid_type, inplace=True),
+        )
+
+        # optional normal conv projection after extracting tensor
+        self.out_norm = torch.nn.LayerNorm(dim)
+
+    def forward(self, z):
+        # z: [B, P, D]
+        B, P, D = z.shape
+        H = W = self.grid_size
+        assert P == H * W, f"Expected P={H*W}, got {P}"
+        assert D == self.dim
+
+        x = z.view(B, H, W, D).permute(0, 3, 1, 2).contiguous()
+
+        x = enn.GeometricTensor(x, self.in_type)
+        y = self.adapter(x).tensor          # [B, hidden*N, H, W] == [B,D,H,W]
+
+        y = y.permute(0, 2, 3, 1).reshape(B, P, D).contiguous()
+        y = self.out_norm(y)
+
+        # residual adapter, more stable for frozen DINO
+        return z + y
 
 class DinoGridEncoder(nn.Module):
     def __init__(
@@ -239,21 +311,30 @@ class DinoGridEncoder(nn.Module):
         freeze=True,
         adapter_dim=384,
         use_adapter=True,
+        adapter_type="mlp",      # "none" | "mlp" | "equi"
+        image_size=224,
+        equi_N=4,
     ):
         super().__init__()
         self.dino = DinoEncoder(name=name, feature_key=feature_key)
         self.dino_dim = self.dino.emb_dim
         self.patch_size = self.dino.patch_size
         self.freeze = freeze
-        self.use_adapter = use_adapter
+
+        self.grid_size = image_size // self.patch_size
         self.emb_dim = adapter_dim if use_adapter else self.dino_dim
+        self.adapter_type = adapter_type
 
         if freeze:
             for p in self.dino.parameters():
                 p.requires_grad = False
             self.dino.eval()
 
-        if use_adapter:
+        if not use_adapter or adapter_type == "none":
+            self.adapter = nn.Identity()
+            self.emb_dim = self.dino_dim
+
+        elif adapter_type == "mlp":
             self.adapter = nn.Sequential(
                 nn.LayerNorm(self.dino_dim),
                 nn.Linear(self.dino_dim, adapter_dim),
@@ -261,8 +342,23 @@ class DinoGridEncoder(nn.Module):
                 nn.Linear(adapter_dim, adapter_dim),
                 nn.LayerNorm(adapter_dim),
             )
+            self.emb_dim = adapter_dim
+
+        elif adapter_type == "equi":
+            assert self.dino_dim == adapter_dim, (
+                "For the first version, keep adapter_dim == dino_dim, "
+                "e.g. DINOv2 ViT-S dim=384."
+            )
+            self.adapter = EquivariantAdapter(
+                dim=self.dino_dim,
+                grid_size=self.grid_size,
+                N=equi_N,
+                hidden=self.dino_dim // equi_N,
+            )
+            self.emb_dim = self.dino_dim
+
         else:
-            self.adapter = nn.Identity()
+            raise ValueError(f"Unknown adapter_type: {adapter_type}")
 
     def forward(self, x):
         # x: [B, C, T, H, W]

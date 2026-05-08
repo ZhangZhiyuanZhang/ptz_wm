@@ -179,6 +179,15 @@ def parse_args():
     parser.add_argument("--predictor-type", type=str, default="vit", choices=["rnn", "vit"])
     parser.add_argument("--eq-weight", type=float, default=0.0)
     parser.add_argument("--backward-weight", type=float, default=0.0)
+
+    parser.add_argument(
+        "--dino-adapter-type",
+        type=str,
+        default="none",
+        choices=["none", "mlp", "equi"],
+    )
+
+    parser.add_argument("--equi-N", type=int, default=4)
     
     return parser.parse_args()
 
@@ -261,7 +270,10 @@ def build_model(args, action_dim: int) -> WorldModel:
             name=args.dino_name,
             feature_key="x_norm_patchtokens",
             freeze=True,
-            use_adapter=False,
+            use_adapter=args.dino_adapter_type != "none",
+            adapter_type=args.dino_adapter_type,
+            image_size=args.image_size,
+            equi_N=args.equi_N,
         )
 
         grid_size = args.image_size // encoder.patch_size

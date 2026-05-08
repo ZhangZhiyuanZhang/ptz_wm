@@ -85,6 +85,9 @@ class PlannerConfig:
     # PTZ actions are discrete commands, usually each dim in {-1, 0, 1}.
     discrete_action: bool = True
 
+    dino_adapter_type: str = "none"
+    equi_N: int = 4
+
 
 def build_vision_encoder(cfg):
     return ImpalaEncoder(
@@ -175,7 +178,10 @@ def build_model(cfg: PlannerConfig) -> WorldModel:
             name=cfg.dino_name,
             feature_key="x_norm_patchtokens",
             freeze=True,
-            use_adapter=False,
+            use_adapter=cfg.dino_adapter_type != "none",
+            adapter_type=cfg.dino_adapter_type,
+            image_size=cfg.image_size,
+            equi_N=cfg.equi_N,
         )
 
         grid_size = cfg.image_size // encoder.patch_size

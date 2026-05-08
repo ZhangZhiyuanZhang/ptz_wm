@@ -281,6 +281,10 @@ def main() -> None:
 
     parser.add_argument("--stop-on-success", action="store_true")
 
+    parser.add_argument("--dino-adapter-type", type=str, default="none",
+                        choices=["none", "mlp", "equi"])
+    parser.add_argument("--equi-N", type=int, default=4)
+
     args = parser.parse_args()
 
     args.output_dir = Path(args.output_dir)
@@ -365,6 +369,8 @@ def main() -> None:
         encoder_type=args.encoder_type,
         predictor_type=args.predictor_type,
         discrete_action=args.discrete_action,
+        dino_adapter_type=args.dino_adapter_type,
+        equi_N=args.equi_N,
     )
 
     model = build_model(planner_cfg)
